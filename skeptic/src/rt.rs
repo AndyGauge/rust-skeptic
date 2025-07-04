@@ -5,7 +5,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 use cargo_metadata::Edition;
@@ -15,11 +15,17 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use walkdir::WalkDir;
 
-// Global cache for rlib dependencies to avoid recomputing for every test
-static RLIB_CACHE: OnceLock<Mutex<HashMap<(PathBuf, PathBuf), Vec<Fingerprint>>>> = OnceLock::new();
+// Type alias to reduce complexity
+type RlibCacheMap = HashMap<(PathBuf, PathBuf), Vec<Fingerprint>>;
 
-fn get_rlib_cache() -> &'static Mutex<HashMap<(PathBuf, PathBuf), Vec<Fingerprint>>> {
-    RLIB_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+// Global cache for rlib dependencies to avoid recomputing for every test
+// Using lazy_static for compatibility with older Rust versions
+lazy_static::lazy_static! {
+    static ref RLIB_CACHE: Mutex<RlibCacheMap> = Mutex::new(HashMap::new());
+}
+
+fn get_rlib_cache() -> &'static Mutex<RlibCacheMap> {
+    &RLIB_CACHE
 }
 
 // Persistent cache structure
@@ -438,7 +444,7 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
     
     // Save to persistent cache
     persistent_cache.insert(cache_key_str, result.clone(), cache_key_hash);
-    if let Err(_) = persistent_cache.save_to_file(&root_dir) {
+    if persistent_cache.save_to_file(&root_dir).is_err() {
         // Don't fail the entire operation if we can't save the cache
         // This is non-fatal since the operation completed successfully
     }
@@ -638,37 +644,43 @@ fn extract_version_from_fingerprint<P: AsRef<Path>>(path: P, metadata: Option<&c
                     .filter(|pkg| pkg.name.replace('-', "_") == lib_name)
                     .collect();
                 
-                if matching_packages.len() == 1 {
-                    // Only one version, use it
-                    return Ok(Some(matching_packages[0].version.to_string()));
-                } else if matching_packages.len() > 1 {
-                    // Multiple versions - need to determine which one this fingerprint belongs to
-                    
-                    // Try to read the fingerprint file to get more info
-                    if let Ok(content) = fs::read_to_string(path) {
-                        // Look for dependency information that might help us distinguish versions
-                        for pkg in &matching_packages {
-                            // Check if this fingerprint references dependencies that are specific to this version
-                            if pkg.version.to_string().starts_with("0.8") && content.contains("rand_chacha") {
-                                // rand 0.8.x uses rand_chacha
-                                return Ok(Some(pkg.version.to_string()));
-                            } else if pkg.version.to_string().starts_with("0.5") && content.contains("rand_core") && content.contains("0.3") {
-                                // rand 0.5.x uses rand_core 0.3
-                                return Ok(Some(pkg.version.to_string()));
+                match matching_packages.len() {
+                    1 => {
+                        // Only one version, use it
+                        return Ok(Some(matching_packages[0].version.to_string()));
+                    }
+                    n if n > 1 => {
+                        // Multiple versions - need to determine which one this fingerprint belongs to
+                        
+                        // Try to read the fingerprint file to get more info
+                        if let Ok(content) = fs::read_to_string(path) {
+                            // Look for dependency information that might help us distinguish versions
+                            for pkg in &matching_packages {
+                                // Check if this fingerprint references dependencies that are specific to this version
+                                if pkg.version.to_string().starts_with("0.8") && content.contains("rand_chacha") {
+                                    // rand 0.8.x uses rand_chacha
+                                    return Ok(Some(pkg.version.to_string()));
+                                } else if pkg.version.to_string().starts_with("0.5") && content.contains("rand_core") && content.contains("0.3") {
+                                    // rand 0.5.x uses rand_core 0.3
+                                    return Ok(Some(pkg.version.to_string()));
+                                }
                             }
                         }
+                        
+                        // If we can't determine from dependencies, sort by version and use the hash as a tiebreaker
+                        let mut sorted_packages = matching_packages;
+                        sorted_packages.sort_by(|a, b| a.version.cmp(&b.version));
+                        
+                        // Use the hash to determine which version this is
+                        let hash = dir_name.split('-').next_back().unwrap_or("");
+                        if hash.len() >= 8 {
+                            let hash_val = u64::from_str_radix(&hash[..8], 16).unwrap_or(0);
+                            let idx = (hash_val % sorted_packages.len() as u64) as usize;
+                            return Ok(Some(sorted_packages[idx].version.to_string()));
+                        }
                     }
-                    
-                    // If we can't determine from dependencies, sort by version and use the hash as a tiebreaker
-                    let mut sorted_packages = matching_packages;
-                    sorted_packages.sort_by(|a, b| a.version.cmp(&b.version));
-                    
-                    // Use the hash to determine which version this is
-                    let hash = dir_name.split('-').last().unwrap_or("");
-                    if hash.len() >= 8 {
-                        let hash_val = u64::from_str_radix(&hash[..8], 16).unwrap_or(0);
-                        let idx = (hash_val % sorted_packages.len() as u64) as usize;
-                        return Ok(Some(sorted_packages[idx].version.to_string()));
+                    _ => {
+                        // No matching packages or zero packages - continue to fallback logic
                     }
                 }
             }
