@@ -5,6 +5,7 @@ fn main() {
         "../README.md",
         "../template-example.md",
         "tests/hashtag-test.md",
+        "tests/rand-gen-range-test.md",
         "tests/should-panic-test.md",
         "tests/section-names.md",
         "tests/two-rand-versions-real.md",

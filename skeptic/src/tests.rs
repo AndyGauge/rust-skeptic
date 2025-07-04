@@ -36,8 +36,10 @@ fn test_omitted_lines() {
 fn test_markdown_files_of_directory() {
     let files = [
         "../testing/tests/hashtag-test.md",
+        "../testing/tests/rand-gen-range-test.md",
         "../testing/tests/section-names.md",
         "../testing/tests/should-panic-test.md",
+        "../testing/tests/two-rand-versions-real.md",
     ];
     let files: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
     assert_eq!(markdown_files_of_directory("../testing/tests/"), files);

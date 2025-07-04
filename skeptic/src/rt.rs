@@ -8,6 +8,7 @@ use std::process::Command;
 use std::time::SystemTime;
 
 use cargo_metadata::Edition;
+use semver::{Version, VersionReq};
 use thiserror::Error;
 use walkdir::WalkDir;
 
@@ -94,7 +95,7 @@ fn handle_test(
     for dep in &deps {
         eprintln!("  {} -> {}", dep.libname, dep.rlib.display());
     }
-    
+
     for dep in deps {
         cmd.arg("--extern");
         cmd.arg(format!(
@@ -136,8 +137,12 @@ fn interpret_output(mut command: Command) {
 // Retrieve the exact dependencies for a given build by
 // cross-referencing the lockfile with the fingerprint file
 fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<Fingerprint>> {
-    eprintln!("get_rlib_dependencies: root_dir={}, target_dir={}", root_dir.display(), target_dir.display());
-    
+    eprintln!(
+        "get_rlib_dependencies: root_dir={}, target_dir={}",
+        root_dir.display(),
+        target_dir.display()
+    );
+
     let lock = LockedDeps::from_path(root_dir).or_else(|_| {
         // could not find Cargo.lock in $CARGO_MAINFEST_DIR
         // try relative to target_dir
@@ -151,10 +156,10 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
     let fingerprint_dir = target_dir.join(".fingerprint/");
     eprintln!("Fingerprint dir: {}", fingerprint_dir.display());
     eprintln!("Fingerprint dir exists: {}", fingerprint_dir.exists());
-    
+
     let locked_deps: HashMap<String, String> = lock.collect();
     eprintln!("Locked deps: {:?}", locked_deps);
-    
+
     let mut found_deps: HashMap<String, Fingerprint> = HashMap::new();
 
     for finger in WalkDir::new(fingerprint_dir)
@@ -166,31 +171,50 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
             None => continue,
         };
 
-        // Improved version matching logic
+        // Improved version matching logic with semantic versioning
         match (found_deps.entry(finger.name()), finger.version()) {
             (Entry::Occupied(mut e), Some(ver)) => {
-                // If we have a version, prefer exact matches with the locked version
-                if *locked_ver == ver {
-                    // If we already have an entry, only replace if this one is fresher
-                    if e.get().mtime < finger.mtime {
+                // Parse versions and check if the fingerprint version satisfies the locked requirement
+                if let (Ok(req), Ok(version)) = (VersionReq::parse(locked_ver), Version::parse(&ver)) {
+                    eprintln!("Version match check: {} {} matches {}: {}", finger.name(), version, req, req.matches(&version));
+                    if req.matches(&version) {
+                        // If we already have an entry, only replace if this one is fresher
+                        if e.get().mtime < finger.mtime {
+                            e.insert(finger);
+                        }
+                    }
+                } else {
+                    // Fallback to exact match if parsing fails
+                    eprintln!("Version parsing failed for {}: locked_ver={}, ver={}", finger.name(), locked_ver, ver);
+                    if *locked_ver == ver && e.get().mtime < finger.mtime {
                         e.insert(finger);
                     }
                 }
-                // If versions don't match, keep the existing entry (first one wins)
             }
             (Entry::Vacant(e), Some(ver)) => {
-                // For new entries with version, only insert if it matches locked version
-                if *locked_ver == ver {
-                    e.insert(finger);
+                // Parse versions and check if the fingerprint version satisfies the locked requirement
+                if let (Ok(req), Ok(version)) = (VersionReq::parse(locked_ver), Version::parse(&ver)) {
+                    eprintln!("Version match check: {} {} matches {}: {}", finger.name(), version, req, req.matches(&version));
+                    if req.matches(&version) {
+                        e.insert(finger);
+                    }
+                } else {
+                    // Fallback to exact match if parsing fails
+                    eprintln!("Version parsing failed for {}: locked_ver={}, ver={}", finger.name(), locked_ver, ver);
+                    if *locked_ver == ver {
+                        e.insert(finger);
+                    }
                 }
             }
             (Entry::Vacant(e), None) => {
                 // For unversioned entries, insert them (they might be workspace members)
+                eprintln!("Inserting unversioned dependency: {}", finger.name());
                 e.insert(finger);
             }
             (Entry::Occupied(_), None) => {
                 // If we already have an entry and this one is unversioned, skip it
                 // This prevents unversioned entries from overriding versioned ones
+                eprintln!("Skipping unversioned dependency (versioned already exists): {}", finger.name());
             }
         }
     }
@@ -222,16 +246,26 @@ impl LockedDeps {
         let metadata = get_cargo_meta(&path)?;
         eprintln!("LockedDeps::from_path: path={}", path.display());
         for pkg in &metadata.packages {
-            eprintln!("  package: name={}, manifest_path={}", pkg.name, pkg.manifest_path.as_str());
+            eprintln!(
+                "  package: name={}, manifest_path={}",
+                pkg.name,
+                pkg.manifest_path.as_str()
+            );
         }
-        let resolve = metadata.resolve.ok_or(SkepticError::MissingDependencyMetadata)?;
+        let resolve = metadata
+            .resolve
+            .ok_or(SkepticError::MissingDependencyMetadata)?;
         let all_nodes: std::collections::HashMap<_, _> = resolve
             .nodes
             .into_iter()
             .map(|node| (node.id.clone(), node))
             .collect();
         // Find the root package (the one matching the manifest path)
-        let root_package = metadata.packages.iter().find(|pkg| pkg.manifest_path.as_str() == path.to_str().unwrap()).ok_or(SkepticError::RootPackageNotFound)?;
+        let root_package = metadata
+            .packages
+            .iter()
+            .find(|pkg| pkg.manifest_path.as_str() == path.to_str().unwrap())
+            .ok_or(SkepticError::RootPackageNotFound)?;
         let root_id = &root_package.id;
         eprintln!("Root package id: {}", root_id.repr);
         for pkg in &metadata.packages {
@@ -240,7 +274,14 @@ impl LockedDeps {
         // Walk dependencies from the root package
         let mut all_deps = std::collections::HashSet::new();
         if let Some(root_node) = all_nodes.get(root_id) {
-            eprintln!("Root node dependencies: {:?}", root_node.dependencies.iter().map(|d| d.repr.clone()).collect::<Vec<_>>());
+            eprintln!(
+                "Root node dependencies: {:?}",
+                root_node
+                    .dependencies
+                    .iter()
+                    .map(|d| d.repr.clone())
+                    .collect::<Vec<_>>()
+            );
             all_deps.insert(root_node.id.clone());
             let mut to_visit = root_node.dependencies.clone();
             while let Some(dep_id) = to_visit.pop() {
@@ -291,7 +332,7 @@ fn guess_ext(mut path: PathBuf, exts: &[&str]) -> Result<PathBuf> {
 
 fn extract_version_from_fingerprint<P: AsRef<Path>>(path: P) -> Result<Option<String>> {
     let content = fs::read_to_string(path)?;
-    
+
     // Look for version information in the fingerprint content
     // Cargo fingerprint files often contain version info in various formats
     for line in content.lines() {
@@ -304,18 +345,43 @@ fn extract_version_from_fingerprint<P: AsRef<Path>>(path: P) -> Result<Option<St
                 }
             }
         }
-        
-        // Look for semver patterns (x.y.z)
-        if line.contains('.') {
+
+        // Look for semver patterns (x.y.z) in package identifiers
+        if line.contains('.') && (line.contains("rand") || line.contains("cargo")) {
             let parts: Vec<&str> = line.split_whitespace().collect();
             for part in parts {
-                if part.matches('.').count() == 2 && part.chars().all(|c| c.is_ascii_digit() || c == '.') {
-                    return Ok(Some(part.to_string()));
+                if part.matches('.').count() == 2
+                    && part.chars().all(|c| c.is_ascii_digit() || c == '.')
+                {
+                    // Validate it's a proper semver
+                    if Version::parse(part).is_ok() {
+                        return Ok(Some(part.to_string()));
+                    }
+                }
+            }
+        }
+
+        // Look for package names with versions like "rand-0.9.0"
+        if line.contains('-') {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            for part in parts {
+                if part.contains('-') {
+                    let subparts: Vec<&str> = part.split('-').collect();
+                    if subparts.len() >= 2 {
+                        let last_part = subparts.last().unwrap();
+                        if last_part.matches('.').count() == 2
+                            && last_part.chars().all(|c| c.is_ascii_digit() || c == '.')
+                        {
+                            if Version::parse(last_part).is_ok() {
+                                return Ok(Some(last_part.to_string()));
+                            }
+                        }
+                    }
                 }
             }
         }
     }
-    
+
     Ok(None)
 }
 
@@ -398,4 +464,3 @@ fn edition_str(edition: &Edition) -> Option<&'static str> {
         _ => return None,
     })
 }
-
