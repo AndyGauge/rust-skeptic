@@ -89,7 +89,13 @@ fn handle_test(
         .arg("--target")
         .arg(target_triple);
 
-    for dep in get_rlib_dependencies(root_dir, target_dir).expect("failed to read dependencies") {
+    let deps = get_rlib_dependencies(root_dir, target_dir).expect("failed to read dependencies");
+    eprintln!("Found {} dependencies:", deps.len());
+    for dep in &deps {
+        eprintln!("  {} -> {}", dep.libname, dep.rlib.display());
+    }
+    
+    for dep in deps {
         cmd.arg("--extern");
         cmd.arg(format!(
             "{}={}",
@@ -130,17 +136,25 @@ fn interpret_output(mut command: Command) {
 // Retrieve the exact dependencies for a given build by
 // cross-referencing the lockfile with the fingerprint file
 fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<Fingerprint>> {
+    eprintln!("get_rlib_dependencies: root_dir={}, target_dir={}", root_dir.display(), target_dir.display());
+    
     let lock = LockedDeps::from_path(root_dir).or_else(|_| {
         // could not find Cargo.lock in $CARGO_MAINFEST_DIR
         // try relative to target_dir
         let mut root_dir = target_dir.clone();
         root_dir.pop();
         root_dir.pop();
+        eprintln!("Trying alternative root_dir: {}", root_dir.display());
         LockedDeps::from_path(root_dir)
     })?;
 
     let fingerprint_dir = target_dir.join(".fingerprint/");
+    eprintln!("Fingerprint dir: {}", fingerprint_dir.display());
+    eprintln!("Fingerprint dir exists: {}", fingerprint_dir.exists());
+    
     let locked_deps: HashMap<String, String> = lock.collect();
+    eprintln!("Locked deps: {:?}", locked_deps);
+    
     let mut found_deps: HashMap<String, Fingerprint> = HashMap::new();
 
     for finger in WalkDir::new(fingerprint_dir)
@@ -152,22 +166,32 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
             None => continue,
         };
 
-        // TODO this should be refactored to something more readable
+        // Improved version matching logic
         match (found_deps.entry(finger.name()), finger.version()) {
             (Entry::Occupied(mut e), Some(ver)) => {
-                // we find better match only if it is exact version match
-                // and has fresher build time
-                if *locked_ver == ver && e.get().mtime < finger.mtime {
+                // If we have a version, prefer exact matches with the locked version
+                if *locked_ver == ver {
+                    // If we already have an entry, only replace if this one is fresher
+                    if e.get().mtime < finger.mtime {
+                        e.insert(finger);
+                    }
+                }
+                // If versions don't match, keep the existing entry (first one wins)
+            }
+            (Entry::Vacant(e), Some(ver)) => {
+                // For new entries with version, only insert if it matches locked version
+                if *locked_ver == ver {
                     e.insert(finger);
                 }
             }
-            (Entry::Vacant(e), ver) => {
-                // we see an exact match or unversioned version
-                if ver.unwrap_or_else(|| locked_ver.clone()) == *locked_ver {
-                    e.insert(finger);
-                }
+            (Entry::Vacant(e), None) => {
+                // For unversioned entries, insert them (they might be workspace members)
+                e.insert(finger);
             }
-            _ => (),
+            (Entry::Occupied(_), None) => {
+                // If we already have an entry and this one is unversioned, skip it
+                // This prevents unversioned entries from overriding versioned ones
+            }
         }
     }
 
@@ -180,7 +204,7 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
 // An iterator over the root dependencies in a lockfile
 #[derive(Debug)]
 struct LockedDeps {
-    dependencies: Vec<String>,
+    dependencies: Vec<(String, String)>,
 }
 
 fn get_cargo_meta<P: AsRef<Path> + std::convert::AsRef<std::ffi::OsStr>>(
@@ -191,35 +215,59 @@ fn get_cargo_meta<P: AsRef<Path> + std::convert::AsRef<std::ffi::OsStr>>(
         .exec()?)
 }
 
+// Update LockedDeps to accept a package name
 impl LockedDeps {
     fn from_path<P: AsRef<Path>>(path: P) -> Result<LockedDeps> {
         let path = path.as_ref().join("Cargo.toml");
-        let metadata = get_cargo_meta(path)?;
-        let workspace_members = metadata.workspace_members;
-        let deps = metadata
-            .resolve
-            .ok_or("Missing dependency metadata")?
+        let metadata = get_cargo_meta(&path)?;
+        eprintln!("LockedDeps::from_path: path={}", path.display());
+        for pkg in &metadata.packages {
+            eprintln!("  package: name={}, manifest_path={}", pkg.name, pkg.manifest_path.as_str());
+        }
+        let resolve = metadata.resolve.ok_or("Missing dependency metadata")?;
+        let all_nodes: std::collections::HashMap<_, _> = resolve
             .nodes
             .into_iter()
-            .filter(|node| workspace_members.contains(&node.id))
-            .flat_map(|node| node.dependencies.into_iter())
-            .chain(workspace_members.clone());
-
+            .map(|node| (node.id.clone(), node))
+            .collect();
+        // Find the root package (the one matching the manifest path)
+        let root_package = metadata.packages.iter().find(|pkg| pkg.manifest_path.as_str() == path.to_str().unwrap()).ok_or("Root package not found")?;
+        let root_id = &root_package.id;
+        eprintln!("Root package id: {}", root_id.repr);
+        for pkg in &metadata.packages {
+            eprintln!("  id: {} name: {}", pkg.id.repr, pkg.name);
+        }
+        // Walk dependencies from the root package
+        let mut all_deps = std::collections::HashSet::new();
+        if let Some(root_node) = all_nodes.get(root_id) {
+            eprintln!("Root node dependencies: {:?}", root_node.dependencies.iter().map(|d| d.repr.clone()).collect::<Vec<_>>());
+            all_deps.insert(root_node.id.clone());
+            let mut to_visit = root_node.dependencies.clone();
+            while let Some(dep_id) = to_visit.pop() {
+                if all_deps.insert(dep_id.clone()) {
+                    if let Some(dep_node) = all_nodes.get(&dep_id) {
+                        to_visit.extend(dep_node.dependencies.clone());
+                    }
+                }
+            }
+        }
+        // Collect (name, version) pairs for all_deps
+        let mut dep_pairs = Vec::new();
+        for node_id in &all_deps {
+            if let Some(pkg) = metadata.packages.iter().find(|p| &p.id == node_id) {
+                dep_pairs.push((pkg.name.replace('-', "_"), pkg.version.to_string()));
+            }
+        }
         Ok(LockedDeps {
-            dependencies: deps.map(|node| node.repr).collect(),
+            dependencies: dep_pairs,
         })
     }
 }
 
 impl Iterator for LockedDeps {
     type Item = (String, String);
-
     fn next(&mut self) -> Option<(String, String)> {
-        let dep = self.dependencies.pop()?;
-        let mut parts = dep.split_whitespace();
-        let name = parts.next()?;
-        let val = parts.next()?;
-        Some((name.replace('-', "_"), val.to_owned()))
+        self.dependencies.pop()
     }
 }
 
@@ -239,6 +287,36 @@ fn guess_ext(mut path: PathBuf, exts: &[&str]) -> Result<PathBuf> {
         }
     }
     Err(ErrorKind::Fingerprint.into())
+}
+
+fn extract_version_from_fingerprint<P: AsRef<Path>>(path: P) -> Result<Option<String>> {
+    let content = fs::read_to_string(path)?;
+    
+    // Look for version information in the fingerprint content
+    // Cargo fingerprint files often contain version info in various formats
+    for line in content.lines() {
+        // Look for patterns like "version: 1.2.3" or "1.2.3" after certain keywords
+        if line.contains("version:") {
+            if let Some(version) = line.split("version:").nth(1) {
+                let version = version.trim();
+                if !version.is_empty() {
+                    return Ok(Some(version.to_string()));
+                }
+            }
+        }
+        
+        // Look for semver patterns (x.y.z)
+        if line.contains('.') {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            for part in parts {
+                if part.matches('.').count() == 2 && part.chars().all(|c| c.is_digit(10) || c == '.') {
+                    return Ok(Some(part.to_string()));
+                }
+            }
+        }
+    }
+    
+    Ok(None)
 }
 
 impl Fingerprint {
@@ -270,9 +348,12 @@ impl Fingerprint {
         dll.push(format!("deps/{}-{}", libname, hash));
         rlib = guess_ext(rlib, &["rlib", "so", "dylib"]).or_else(|_| guess_ext(dll, &["dll"]))?;
 
+        // Try to extract version from the fingerprint file content
+        let version = extract_version_from_fingerprint(path)?;
+
         Ok(Fingerprint {
             libname,
-            version: None,
+            version,
             rlib,
             mtime: fs::metadata(path)?.modified()?,
         })
@@ -309,3 +390,4 @@ fn edition_str(edition: &Edition) -> Option<&'static str> {
         _ => return None,
     })
 }
+
