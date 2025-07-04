@@ -164,11 +164,15 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
     let locked_deps: HashMap<String, String> = lock.collect();
     eprintln!("Locked deps: {:?}", locked_deps);
 
+    // Get cargo metadata once and reuse it for all fingerprints
+    let metadata_path = root_dir.join("Cargo.toml");
+    let metadata = get_cargo_meta(&metadata_path).ok();
+
     let mut found_deps: HashMap<String, Fingerprint> = HashMap::new();
 
     for finger in WalkDir::new(fingerprint_dir)
         .into_iter()
-        .filter_map(|v| Fingerprint::from_path(v.ok()?.path()).ok())
+        .filter_map(|v| Fingerprint::from_path(v.ok()?.path(), metadata.as_ref()).ok())
     {
         let locked_ver = match locked_deps.get(&finger.name()) {
             Some(ver) => ver,
@@ -452,69 +456,51 @@ fn guess_ext(mut path: PathBuf, exts: &[&str]) -> Result<PathBuf> {
     Err(SkepticError::Fingerprint)
 }
 
-fn extract_version_from_fingerprint<P: AsRef<Path>>(path: P) -> Result<Option<String>> {
+fn extract_version_from_fingerprint<P: AsRef<Path>>(path: P, metadata: Option<&cargo_metadata::Metadata>) -> Result<Option<String>> {
     let path = path.as_ref();
     
-    // First, try to extract version from the directory name
-    // The directory name format is usually: package-hash
-    // We can map this to the actual package by looking at cargo metadata
-    if let Some(parent) = path.parent() {
-        if let Some(dir_name) = parent.file_name().and_then(|n| n.to_str()) {
-            // For rand, we have two directories: rand-905b6958fc9436f9 and rand-95dae24b7ccba090
-            // We need to determine which one corresponds to which version
-            
-            // Try to get the cargo metadata to map these
-            let mut cargo_toml = path.to_path_buf();
-            // Navigate up to find Cargo.toml: .fingerprint/package-hash/file -> target/debug/.fingerprint/package-hash/file
-            cargo_toml.pop(); // remove file
-            cargo_toml.pop(); // remove package-hash dir
-            cargo_toml.pop(); // remove .fingerprint
-            cargo_toml.pop(); // remove debug
-            cargo_toml.pop(); // remove target
-            cargo_toml.push("Cargo.toml");
-            
-            if cargo_toml.exists() {
-                if let Ok(metadata) = get_cargo_meta(&cargo_toml) {
-                    let lib_name = dir_name.split('-').next().unwrap_or("").replace('-', "_");
+    // First, try to extract version from the directory name using cached metadata
+    if let Some(metadata) = metadata {
+        if let Some(parent) = path.parent() {
+            if let Some(dir_name) = parent.file_name().and_then(|n| n.to_str()) {
+                let lib_name = dir_name.split('-').next().unwrap_or("").replace('-', "_");
+                
+                // Find all packages with this name
+                let matching_packages: Vec<_> = metadata.packages.iter()
+                    .filter(|pkg| pkg.name.replace('-', "_") == lib_name)
+                    .collect();
+                
+                if matching_packages.len() == 1 {
+                    // Only one version, use it
+                    return Ok(Some(matching_packages[0].version.to_string()));
+                } else if matching_packages.len() > 1 {
+                    // Multiple versions - need to determine which one this fingerprint belongs to
                     
-                    // Find all packages with this name
-                    let matching_packages: Vec<_> = metadata.packages.iter()
-                        .filter(|pkg| pkg.name.replace('-', "_") == lib_name)
-                        .collect();
-                    
-                    if matching_packages.len() == 1 {
-                        // Only one version, use it
-                        return Ok(Some(matching_packages[0].version.to_string()));
-                    } else if matching_packages.len() > 1 {
-                        // Multiple versions - need to determine which one this fingerprint belongs to
-                        // For now, we'll use a heuristic based on the hash
-                        
-                        // Try to read the fingerprint file to get more info
-                        if let Ok(content) = fs::read_to_string(path) {
-                            // Look for dependency information that might help us distinguish versions
-                            for pkg in &matching_packages {
-                                // Check if this fingerprint references dependencies that are specific to this version
-                                                                 if pkg.version.to_string().starts_with("0.8") && content.contains("rand_chacha") {
-                                     // rand 0.8.x uses rand_chacha
-                                     return Ok(Some(pkg.version.to_string()));
-                                 } else if pkg.version.to_string().starts_with("0.5") && content.contains("rand_core") && content.contains("0.3") {
-                                     // rand 0.5.x uses rand_core 0.3
-                                     return Ok(Some(pkg.version.to_string()));
-                                 }
+                    // Try to read the fingerprint file to get more info
+                    if let Ok(content) = fs::read_to_string(path) {
+                        // Look for dependency information that might help us distinguish versions
+                        for pkg in &matching_packages {
+                            // Check if this fingerprint references dependencies that are specific to this version
+                            if pkg.version.to_string().starts_with("0.8") && content.contains("rand_chacha") {
+                                // rand 0.8.x uses rand_chacha
+                                return Ok(Some(pkg.version.to_string()));
+                            } else if pkg.version.to_string().starts_with("0.5") && content.contains("rand_core") && content.contains("0.3") {
+                                // rand 0.5.x uses rand_core 0.3
+                                return Ok(Some(pkg.version.to_string()));
                             }
                         }
-                        
-                        // If we can't determine from dependencies, sort by version and use the hash as a tiebreaker
-                        let mut sorted_packages = matching_packages;
-                        sorted_packages.sort_by(|a, b| a.version.cmp(&b.version));
-                        
-                        // Use the hash to determine which version this is
-                        let hash = dir_name.split('-').last().unwrap_or("");
-                        if hash.len() >= 8 {
-                            let hash_val = u64::from_str_radix(&hash[..8], 16).unwrap_or(0);
-                            let idx = (hash_val % sorted_packages.len() as u64) as usize;
-                            return Ok(Some(sorted_packages[idx].version.to_string()));
-                        }
+                    }
+                    
+                    // If we can't determine from dependencies, sort by version and use the hash as a tiebreaker
+                    let mut sorted_packages = matching_packages;
+                    sorted_packages.sort_by(|a, b| a.version.cmp(&b.version));
+                    
+                    // Use the hash to determine which version this is
+                    let hash = dir_name.split('-').last().unwrap_or("");
+                    if hash.len() >= 8 {
+                        let hash_val = u64::from_str_radix(&hash[..8], 16).unwrap_or(0);
+                        let idx = (hash_val % sorted_packages.len() as u64) as usize;
+                        return Ok(Some(sorted_packages[idx].version.to_string()));
                     }
                 }
             }
@@ -538,7 +524,7 @@ fn extract_version_from_fingerprint<P: AsRef<Path>>(path: P) -> Result<Option<St
 }
 
 impl Fingerprint {
-    fn from_path<P: AsRef<Path>>(path: P) -> Result<Fingerprint> {
+    fn from_path<P: AsRef<Path>>(path: P, metadata: Option<&cargo_metadata::Metadata>) -> Result<Fingerprint> {
         let path = path.as_ref();
 
         // Use the parent path to get libname and hash, replacing - with _
@@ -567,7 +553,7 @@ impl Fingerprint {
         rlib = guess_ext(rlib, &["rlib", "so", "dylib"]).or_else(|_| guess_ext(dll, &["dll"]))?;
 
         // Try to extract version from the fingerprint file content
-        let version = extract_version_from_fingerprint(path)?;
+        let version = extract_version_from_fingerprint(path, metadata)?;
 
         Ok(Fingerprint {
             libname,
