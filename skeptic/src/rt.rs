@@ -11,6 +11,7 @@ use std::time::SystemTime;
 use cargo_metadata::Edition;
 use rayon::prelude::*;
 use semver::{Version, VersionReq};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use walkdir::WalkDir;
 
@@ -19,6 +20,108 @@ static RLIB_CACHE: OnceLock<Mutex<HashMap<(PathBuf, PathBuf), Vec<Fingerprint>>>
 
 fn get_rlib_cache() -> &'static Mutex<HashMap<(PathBuf, PathBuf), Vec<Fingerprint>>> {
     RLIB_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// Persistent cache structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistentCache {
+    cache_version: u32,
+    entries: HashMap<String, CacheEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CacheEntry {
+    fingerprints: Vec<Fingerprint>,
+    cache_key_hash: u64,
+    created_at: SystemTime,
+}
+
+impl PersistentCache {
+    fn new() -> Self {
+        Self {
+            cache_version: 1,
+            entries: HashMap::new(),
+        }
+    }
+    
+    fn get_cache_file_path(root_dir: &Path) -> PathBuf {
+        root_dir.join(".skeptic-cache")
+    }
+    
+    fn load_from_file(root_dir: &Path) -> Result<Self> {
+        let cache_file = Self::get_cache_file_path(root_dir);
+        if !cache_file.exists() {
+            return Ok(Self::new());
+        }
+        
+        let data = fs::read(&cache_file)?;
+        match bincode::deserialize(&data) {
+            Ok(cache) => Ok(cache),
+            Err(_) => {
+                // If deserialization fails, start with a fresh cache
+                Ok(Self::new())
+            }
+        }
+    }
+    
+    fn save_to_file(&self, root_dir: &Path) -> Result<()> {
+        let cache_file = Self::get_cache_file_path(root_dir);
+        let data = bincode::serialize(self).map_err(|e| SkepticError::Io(
+            std::io::Error::new(std::io::ErrorKind::Other, format!("Serialization error: {}", e))
+        ))?;
+        fs::write(&cache_file, data)?;
+        Ok(())
+    }
+    
+    fn generate_cache_key_hash(root_dir: &Path, target_dir: &Path) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        
+        let mut hasher = DefaultHasher::new();
+        
+        // Hash the paths
+        root_dir.hash(&mut hasher);
+        target_dir.hash(&mut hasher);
+        
+        // Hash the Cargo.toml modification time if it exists
+        if let Ok(metadata) = fs::metadata(root_dir.join("Cargo.toml")) {
+            if let Ok(modified) = metadata.modified() {
+                modified.hash(&mut hasher);
+            }
+        }
+        
+        // Hash the Cargo.lock modification time if it exists
+        if let Ok(metadata) = fs::metadata(root_dir.join("Cargo.lock")) {
+            if let Ok(modified) = metadata.modified() {
+                modified.hash(&mut hasher);
+            }
+        }
+        
+        hasher.finish()
+    }
+    
+    fn get(&self, cache_key: &str, expected_hash: u64) -> Option<&Vec<Fingerprint>> {
+        if let Some(entry) = self.entries.get(cache_key) {
+            if entry.cache_key_hash == expected_hash {
+                // Check if cache is not too old (1 hour)
+                if let Ok(elapsed) = entry.created_at.elapsed() {
+                    if elapsed.as_secs() < 3600 {
+                        return Some(&entry.fingerprints);
+                    }
+                }
+            }
+        }
+        None
+    }
+    
+    fn insert(&mut self, cache_key: String, fingerprints: Vec<Fingerprint>, cache_key_hash: u64) {
+        let entry = CacheEntry {
+            fingerprints,
+            cache_key_hash,
+            created_at: SystemTime::now(),
+        };
+        self.entries.insert(cache_key, entry);
+    }
 }
 
 pub fn compile_test(root_dir: &str, out_dir: &str, target_triple: &str, test_text: &str) {
@@ -142,12 +245,26 @@ fn interpret_output(mut command: Command) {
 fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<Fingerprint>> {
     let cache_key = (root_dir.clone(), target_dir.clone());
     
-    // Check cache first
+    // Check in-memory cache first
     {
         let cache = get_rlib_cache().lock().unwrap();
         if let Some(cached_deps) = cache.get(&cache_key) {
             return Ok(cached_deps.clone());
         }
+    }
+    
+    // Check persistent cache
+    let cache_key_str = format!("{}:{}", root_dir.display(), target_dir.display());
+    let cache_key_hash = PersistentCache::generate_cache_key_hash(&root_dir, &target_dir);
+    
+    let mut persistent_cache = PersistentCache::load_from_file(&root_dir)?;
+    if let Some(cached_deps) = persistent_cache.get(&cache_key_str, cache_key_hash) {
+        // Also populate the in-memory cache
+        {
+            let mut cache = get_rlib_cache().lock().unwrap();
+            cache.insert(cache_key.clone(), cached_deps.clone());
+        }
+        return Ok(cached_deps.clone());
     }
 
     let lock = LockedDeps::from_path(root_dir.clone()).or_else(|_| {
@@ -313,13 +430,83 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
         .filter_map(|(_, val)| if val.rlib.exists() { Some(val) } else { None })
         .collect();
     
-    // Cache the result
+    // Cache the result in both in-memory and persistent caches
     {
         let mut cache = get_rlib_cache().lock().unwrap();
         cache.insert(cache_key, result.clone());
     }
     
+    // Save to persistent cache
+    persistent_cache.insert(cache_key_str, result.clone(), cache_key_hash);
+    if let Err(_) = persistent_cache.save_to_file(&root_dir) {
+        // Don't fail the entire operation if we can't save the cache
+        // This is non-fatal since the operation completed successfully
+    }
+    
     Ok(result)
+}
+
+/// Populate the cache during the build phase to make test runs faster
+pub fn populate_cache_during_build(root_dir: &Path, target_triple: &str) -> Result<()> {
+    // During build script execution, we can use the OUT_DIR environment variable
+    // to determine the target directory structure
+    if let Ok(out_dir) = env::var("OUT_DIR") {
+        let out_path = PathBuf::from(&out_dir);
+        
+        // OUT_DIR is typically: target/debug/build/package-name-hash/out
+        // We need to go up to find the target directory with .fingerprint
+        let mut target_dir = out_path.clone();
+        
+        // Go up from out_dir to find the target directory
+        // OUT_DIR structure: target/{profile}/build/{package}-{hash}/out
+        for _ in 0..4 {
+            target_dir.pop();
+            if target_dir.join(".fingerprint").exists() {
+                // Found a valid target directory, populate the cache
+                let cache_key_str = format!("{}:{}", root_dir.display(), target_dir.display());
+                let cache_key_hash = PersistentCache::generate_cache_key_hash(root_dir, &target_dir);
+                
+                // Check if cache is already up to date
+                let persistent_cache = PersistentCache::load_from_file(root_dir)?;
+                if persistent_cache.get(&cache_key_str, cache_key_hash).is_some() {
+                    return Ok(());
+                }
+                
+                // Populate the cache by calling get_rlib_dependencies
+                let _ = get_rlib_dependencies(root_dir.to_path_buf(), target_dir.clone())?;
+                return Ok(());
+            }
+        }
+        
+    }
+    
+    // Fallback: try the traditional locations
+    let potential_target_dirs = [
+        root_dir.join("target").join(target_triple).join("debug"),
+        root_dir.join("target").join(target_triple).join("release"),
+        root_dir.join("target").join("debug"),
+        root_dir.join("target").join("release"),
+    ];
+    
+    for target_dir in &potential_target_dirs {
+        if target_dir.exists() && target_dir.join(".fingerprint").exists() {
+            // Found a valid target directory, populate the cache
+            let cache_key_str = format!("{}:{}", root_dir.display(), target_dir.display());
+            let cache_key_hash = PersistentCache::generate_cache_key_hash(root_dir, target_dir);
+            
+            // Check if cache is already up to date
+            let persistent_cache = PersistentCache::load_from_file(root_dir)?;
+            if persistent_cache.get(&cache_key_str, cache_key_hash).is_some() {
+                return Ok(());
+            }
+            
+            // Populate the cache by calling get_rlib_dependencies
+            let _ = get_rlib_dependencies(root_dir.to_path_buf(), target_dir.clone())?;
+            return Ok(());
+        }
+    }
+    
+    Ok(())
 }
 
 // An iterator over the root dependencies in a lockfile
@@ -419,7 +606,7 @@ impl Iterator for LockedDeps {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Fingerprint {
     libname: String,
     version: Option<String>, // version might not be present on path or vcs deps
