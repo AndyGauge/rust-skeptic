@@ -5,12 +5,21 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 use cargo_metadata::Edition;
+use rayon::prelude::*;
 use semver::{Version, VersionReq};
 use thiserror::Error;
 use walkdir::WalkDir;
+
+// Global cache for rlib dependencies to avoid recomputing for every test
+static RLIB_CACHE: OnceLock<Mutex<HashMap<(PathBuf, PathBuf), Vec<Fingerprint>>>> = OnceLock::new();
+
+fn get_rlib_cache() -> &'static Mutex<HashMap<(PathBuf, PathBuf), Vec<Fingerprint>>> {
+    RLIB_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 pub fn compile_test(root_dir: &str, out_dir: &str, target_triple: &str, test_text: &str) {
     handle_test(
@@ -90,13 +99,7 @@ fn handle_test(
         .arg("--target")
         .arg(target_triple);
 
-    let deps = get_rlib_dependencies(root_dir, target_dir).expect("failed to read dependencies");
-    eprintln!("Found {} dependencies:", deps.len());
-    for dep in &deps {
-        eprintln!("  {} -> {}", dep.libname, dep.rlib.display());
-    }
-
-    for dep in deps {
+    for dep in get_rlib_dependencies(root_dir, target_dir).expect("failed to read dependencies") {
         cmd.arg("--extern");
         cmd.arg(format!(
             "{}={}",
@@ -137,11 +140,15 @@ fn interpret_output(mut command: Command) {
 // Retrieve the exact dependencies for a given build by
 // cross-referencing the lockfile with the fingerprint file
 fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<Fingerprint>> {
-    eprintln!(
-        "get_rlib_dependencies: root_dir={}, target_dir={}",
-        root_dir.display(),
-        target_dir.display()
-    );
+    let cache_key = (root_dir.clone(), target_dir.clone());
+    
+    // Check cache first
+    {
+        let cache = get_rlib_cache().lock().unwrap();
+        if let Some(cached_deps) = cache.get(&cache_key) {
+            return Ok(cached_deps.clone());
+        }
+    }
 
     let lock = LockedDeps::from_path(root_dir.clone()).or_else(|_| {
         // could not find Cargo.lock in $CARGO_MAINFEST_DIR
@@ -149,20 +156,14 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
         let mut root_dir = target_dir.clone();
         root_dir.pop();
         root_dir.pop();
-        eprintln!("Trying alternative root_dir: {}", root_dir.display());
         LockedDeps::from_path(root_dir)
     })?;
 
     let fingerprint_dir = target_dir.join(".fingerprint/");
-    eprintln!("Fingerprint dir: {}", fingerprint_dir.display());
-    eprintln!("Fingerprint dir exists: {}", fingerprint_dir.exists());
 
     // Get direct dependencies first before consuming the lock
     let direct_deps = lock.get_direct_dependencies().clone();
-    eprintln!("Direct deps: {:?}", direct_deps);
-    
     let locked_deps: HashMap<String, String> = lock.collect();
-    eprintln!("Locked deps: {:?}", locked_deps);
 
     // Get cargo metadata once and reuse it for all fingerprints
     let metadata_path = root_dir.join("Cargo.toml");
@@ -170,10 +171,20 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
 
     let mut found_deps: HashMap<String, Fingerprint> = HashMap::new();
 
-    for finger in WalkDir::new(fingerprint_dir)
+    // Collect all fingerprint paths first
+    let fingerprint_paths: Vec<_> = WalkDir::new(fingerprint_dir)
         .into_iter()
-        .filter_map(|v| Fingerprint::from_path(v.ok()?.path(), metadata.as_ref()).ok())
-    {
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path().to_owned())
+        .collect();
+
+    // Process fingerprints in parallel
+    let fingerprints: Vec<_> = fingerprint_paths
+        .par_iter()
+        .filter_map(|path| Fingerprint::from_path(path, metadata.as_ref()).ok())
+        .collect();
+
+    for finger in fingerprints {
         let locked_ver = match locked_deps.get(&finger.name()) {
             Some(ver) => ver,
             None => continue,
@@ -193,21 +204,16 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
                 // For direct dependencies, require exact version match
                 if let Some(req_ver) = required_version {
                     if *req_ver == ver {
-                        eprintln!("Direct dependency exact match for {}: {} == {}", finger.name(), req_ver, ver);
                         e.insert(finger);
-                    } else {
-                        eprintln!("Direct dependency version mismatch for {}: required {}, found {}", finger.name(), req_ver, ver);
                     }
                 } else {
                     // For transitive dependencies, use the existing logic
                     // First try exact version match (highest priority)
                     if *locked_ver == ver {
-                        eprintln!("Exact version match for {}: {} == {}", finger.name(), locked_ver, ver);
                         e.insert(finger);
                     } else {
                         // Then try semantic version matching
                         if let (Ok(req), Ok(version)) = (VersionReq::parse(locked_ver), Version::parse(&ver)) {
-                            eprintln!("Version match check: {} {} matches {}: {}", finger.name(), version, req, req.matches(&version));
                             if req.matches(&version) {
                                 // Only replace if we don't have an exact match already
                                 let current = e.get();
@@ -232,7 +238,6 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
                             };
                             
                             if let (Ok(req), Ok(version)) = (VersionReq::parse(&req_str), Version::parse(&ver)) {
-                                eprintln!("Fallback version match: {} {} matches {} (from {}): {}", finger.name(), version, req, req_str, req.matches(&version));
                                 if req.matches(&version) {
                                     let current = e.get();
                                     if let Some(current_ver) = &current.version {
@@ -245,7 +250,6 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
                                 }
                             } else {
                                 // Final fallback to exact match if parsing fails
-                                eprintln!("Version parsing failed for {}: locked_ver={}, ver={}", finger.name(), locked_ver, ver);
                                 if *locked_ver == ver && e.get().mtime < finger.mtime {
                                     e.insert(finger);
                                 }
@@ -258,21 +262,16 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
                 // For direct dependencies, require exact version match
                 if let Some(req_ver) = required_version {
                     if *req_ver == ver {
-                        eprintln!("Direct dependency exact match for {}: {} == {}", finger.name(), req_ver, ver);
                         e.insert(finger);
-                    } else {
-                        eprintln!("Direct dependency version mismatch for {}: required {}, found {}", finger.name(), req_ver, ver);
                     }
                 } else {
                     // For transitive dependencies, use the existing logic
                     // First try exact version match (highest priority)
                     if *locked_ver == ver {
-                        eprintln!("Exact version match for {}: {} == {}", finger.name(), locked_ver, ver);
                         e.insert(finger);
                     } else {
                         // Then try semantic version matching
                         if let (Ok(req), Ok(version)) = (VersionReq::parse(locked_ver), Version::parse(&ver)) {
-                            eprintln!("Version match check: {} {} matches {}: {}", finger.name(), version, req, req.matches(&version));
                             if req.matches(&version) {
                                 e.insert(finger);
                             }
@@ -285,13 +284,11 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
                             };
                             
                             if let (Ok(req), Ok(version)) = (VersionReq::parse(&req_str), Version::parse(&ver)) {
-                                eprintln!("Fallback version match: {} {} matches {} (from {}): {}", finger.name(), version, req, req_str, req.matches(&version));
                                 if req.matches(&version) {
                                     e.insert(finger);
                                 }
                             } else {
                                 // Final fallback to exact match if parsing fails
-                                eprintln!("Version parsing failed for {}: locked_ver={}, ver={}", finger.name(), locked_ver, ver);
                                 if *locked_ver == ver {
                                     e.insert(finger);
                                 }
@@ -302,21 +299,27 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
             }
             (Entry::Vacant(e), None) => {
                 // For unversioned entries, insert them (they might be workspace members)
-                eprintln!("Inserting unversioned dependency: {}", finger.name());
                 e.insert(finger);
             }
             (Entry::Occupied(_), None) => {
                 // If we already have an entry and this one is unversioned, skip it
                 // This prevents unversioned entries from overriding versioned ones
-                eprintln!("Skipping unversioned dependency (versioned already exists): {}", finger.name());
             }
         }
     }
 
-    Ok(found_deps
+    let result: Vec<Fingerprint> = found_deps
         .into_iter()
         .filter_map(|(_, val)| if val.rlib.exists() { Some(val) } else { None })
-        .collect())
+        .collect();
+    
+    // Cache the result
+    {
+        let mut cache = get_rlib_cache().lock().unwrap();
+        cache.insert(cache_key, result.clone());
+    }
+    
+    Ok(result)
 }
 
 // An iterator over the root dependencies in a lockfile
@@ -339,14 +342,6 @@ impl LockedDeps {
     fn from_path<P: AsRef<Path>>(path: P) -> Result<LockedDeps> {
         let path = path.as_ref().join("Cargo.toml");
         let metadata = get_cargo_meta(&path)?;
-        eprintln!("LockedDeps::from_path: path={}", path.display());
-        for pkg in &metadata.packages {
-            eprintln!(
-                "  package: name={}, manifest_path={}",
-                pkg.name,
-                pkg.manifest_path.as_str()
-            );
-        }
         let resolve = metadata
             .resolve
             .ok_or(SkepticError::MissingDependencyMetadata)?;
@@ -362,29 +357,15 @@ impl LockedDeps {
             .find(|pkg| pkg.manifest_path.as_str() == path.to_str().unwrap())
             .ok_or(SkepticError::RootPackageNotFound)?;
         let root_id = &root_package.id;
-        eprintln!("Root package id: {}", root_id.repr);
-        for pkg in &metadata.packages {
-            eprintln!("  id: {} name: {}", pkg.id.repr, pkg.name);
-        }
         
         // First, collect direct dependencies with their versions
         let mut direct_deps = std::collections::HashMap::new();
         if let Some(root_node) = all_nodes.get(root_id) {
-            eprintln!(
-                "Root node dependencies: {:?}",
-                root_node
-                    .dependencies
-                    .iter()
-                    .map(|d| d.repr.clone())
-                    .collect::<Vec<_>>()
-            );
-            
             // Collect direct dependencies first
             for dep_id in &root_node.dependencies {
                 if let Some(pkg) = metadata.packages.iter().find(|p| &p.id == dep_id) {
                     let name = pkg.name.replace('-', "_");
                     direct_deps.insert(name.clone(), pkg.version.to_string());
-                    eprintln!("Direct dependency: {} = {}", name, pkg.version);
                 }
             }
             
@@ -438,7 +419,7 @@ impl Iterator for LockedDeps {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Fingerprint {
     libname: String,
     version: Option<String>, // version might not be present on path or vcs deps

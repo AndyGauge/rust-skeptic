@@ -21,6 +21,7 @@ tempfile = "3"
 walkdir = "2.2"
 thiserror = "1"
 semver = "1.0"
+rayon = "1.8"
 
 [dev-dependencies]
 unindent = "0.2"

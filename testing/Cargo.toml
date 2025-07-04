@@ -22,8 +22,9 @@ version = "0.99"
 default_features = false
 features = ["from"]
 
-# Real-world dependencies for testing multiple rand versions
+# Dependencies for testing multiple rand versions scenario
 [dependencies]
 rand = "0.8"
 criterion = "0.6"
-crossbeam = "0.5"
+oorandom = "11"
+
