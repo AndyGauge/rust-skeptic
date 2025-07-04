@@ -34,7 +34,7 @@ fn test_omitted_lines() {
 
 #[test]
 fn test_markdown_files_of_directory() {
-    let files = vec![
+    let files = [
         "../testing/tests/hashtag-test.md",
         "../testing/tests/section-names.md",
         "../testing/tests/should-panic-test.md",
@@ -187,7 +187,7 @@ fn get_line_number_from_test_name(test: Test) -> String {
     String::from(
         test.name
             .split('_')
-            .last()
+            .next_back()
             .expect("There were no underscores!"),
     )
 }

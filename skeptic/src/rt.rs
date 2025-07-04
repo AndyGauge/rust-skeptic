@@ -8,7 +8,7 @@ use std::process::Command;
 use std::time::SystemTime;
 
 use cargo_metadata::Edition;
-use error_chain::error_chain;
+use thiserror::Error;
 use walkdir::WalkDir;
 
 pub fn compile_test(root_dir: &str, out_dir: &str, target_triple: &str, test_text: &str) {
@@ -224,14 +224,14 @@ impl LockedDeps {
         for pkg in &metadata.packages {
             eprintln!("  package: name={}, manifest_path={}", pkg.name, pkg.manifest_path.as_str());
         }
-        let resolve = metadata.resolve.ok_or("Missing dependency metadata")?;
+        let resolve = metadata.resolve.ok_or(SkepticError::MissingDependencyMetadata)?;
         let all_nodes: std::collections::HashMap<_, _> = resolve
             .nodes
             .into_iter()
             .map(|node| (node.id.clone(), node))
             .collect();
         // Find the root package (the one matching the manifest path)
-        let root_package = metadata.packages.iter().find(|pkg| pkg.manifest_path.as_str() == path.to_str().unwrap()).ok_or("Root package not found")?;
+        let root_package = metadata.packages.iter().find(|pkg| pkg.manifest_path.as_str() == path.to_str().unwrap()).ok_or(SkepticError::RootPackageNotFound)?;
         let root_id = &root_package.id;
         eprintln!("Root package id: {}", root_id.repr);
         for pkg in &metadata.packages {
@@ -286,7 +286,7 @@ fn guess_ext(mut path: PathBuf, exts: &[&str]) -> Result<PathBuf> {
             return Ok(path);
         }
     }
-    Err(ErrorKind::Fingerprint.into())
+    Err(SkepticError::Fingerprint)
 }
 
 fn extract_version_from_fingerprint<P: AsRef<Path>>(path: P) -> Result<Option<String>> {
@@ -309,7 +309,7 @@ fn extract_version_from_fingerprint<P: AsRef<Path>>(path: P) -> Result<Option<St
         if line.contains('.') {
             let parts: Vec<&str> = line.split_whitespace().collect();
             for part in parts {
-                if part.matches('.').count() == 2 && part.chars().all(|c| c.is_digit(10) || c == '.') {
+                if part.matches('.').count() == 2 && part.chars().all(|c| c.is_ascii_digit() || c == '.') {
                     return Ok(Some(part.to_string()));
                 }
             }
@@ -328,16 +328,16 @@ impl Fingerprint {
             .parent()
             .and_then(Path::file_stem)
             .and_then(OsStr::to_str)
-            .ok_or(ErrorKind::Fingerprint)?
+            .ok_or(SkepticError::Fingerprint)?
             .rsplit('-');
-        let hash = captures.next().ok_or(ErrorKind::Fingerprint)?;
+        let hash = captures.next().ok_or(SkepticError::Fingerprint)?;
         let mut libname_parts = captures.collect::<Vec<_>>();
         libname_parts.reverse();
         let libname = libname_parts.join("_");
 
         path.extension()
             .and_then(|e| if e == "json" { Some(e) } else { None })
-            .ok_or(ErrorKind::Fingerprint)?;
+            .ok_or(SkepticError::Fingerprint)?;
 
         let mut rlib = PathBuf::from(path);
         rlib.pop();
@@ -368,13 +368,21 @@ impl Fingerprint {
     }
 }
 
-error_chain! {
-    errors { Fingerprint }
-    foreign_links {
-        Io(std::io::Error);
-        Metadata(cargo_metadata::Error);
-    }
+#[derive(Debug, Error)]
+pub enum SkepticError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Cargo metadata error: {0}")]
+    Metadata(#[from] cargo_metadata::Error),
+    #[error("Fingerprint error")]
+    Fingerprint,
+    #[error("Root package not found")]
+    RootPackageNotFound,
+    #[error("Missing dependency metadata")]
+    MissingDependencyMetadata,
 }
+
+type Result<T> = std::result::Result<T, SkepticError>;
 
 #[derive(Clone, Copy)]
 enum CompileType {
