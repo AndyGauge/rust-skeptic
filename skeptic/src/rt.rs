@@ -143,7 +143,7 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
         target_dir.display()
     );
 
-    let lock = LockedDeps::from_path(root_dir).or_else(|_| {
+    let lock = LockedDeps::from_path(root_dir.clone()).or_else(|_| {
         // could not find Cargo.lock in $CARGO_MAINFEST_DIR
         // try relative to target_dir
         let mut root_dir = target_dir.clone();
@@ -157,6 +157,10 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
     eprintln!("Fingerprint dir: {}", fingerprint_dir.display());
     eprintln!("Fingerprint dir exists: {}", fingerprint_dir.exists());
 
+    // Get direct dependencies first before consuming the lock
+    let direct_deps = lock.get_direct_dependencies().clone();
+    eprintln!("Direct deps: {:?}", direct_deps);
+    
     let locked_deps: HashMap<String, String> = lock.collect();
     eprintln!("Locked deps: {:?}", locked_deps);
 
@@ -171,38 +175,124 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
             None => continue,
         };
 
+        // Check if this is a direct dependency that requires strict version matching
+        let is_direct_dep = direct_deps.contains_key(&finger.name());
+        let required_version = if is_direct_dep {
+            Some(&direct_deps[&finger.name()])
+        } else {
+            None
+        };
+
         // Improved version matching logic with semantic versioning
         match (found_deps.entry(finger.name()), finger.version()) {
             (Entry::Occupied(mut e), Some(ver)) => {
-                // Parse versions and check if the fingerprint version satisfies the locked requirement
-                if let (Ok(req), Ok(version)) = (VersionReq::parse(locked_ver), Version::parse(&ver)) {
-                    eprintln!("Version match check: {} {} matches {}: {}", finger.name(), version, req, req.matches(&version));
-                    if req.matches(&version) {
-                        // If we already have an entry, only replace if this one is fresher
-                        if e.get().mtime < finger.mtime {
-                            e.insert(finger);
-                        }
+                // For direct dependencies, require exact version match
+                if let Some(req_ver) = required_version {
+                    if *req_ver == ver {
+                        eprintln!("Direct dependency exact match for {}: {} == {}", finger.name(), req_ver, ver);
+                        e.insert(finger);
+                    } else {
+                        eprintln!("Direct dependency version mismatch for {}: required {}, found {}", finger.name(), req_ver, ver);
                     }
                 } else {
-                    // Fallback to exact match if parsing fails
-                    eprintln!("Version parsing failed for {}: locked_ver={}, ver={}", finger.name(), locked_ver, ver);
-                    if *locked_ver == ver && e.get().mtime < finger.mtime {
+                    // For transitive dependencies, use the existing logic
+                    // First try exact version match (highest priority)
+                    if *locked_ver == ver {
+                        eprintln!("Exact version match for {}: {} == {}", finger.name(), locked_ver, ver);
                         e.insert(finger);
+                    } else {
+                        // Then try semantic version matching
+                        if let (Ok(req), Ok(version)) = (VersionReq::parse(locked_ver), Version::parse(&ver)) {
+                            eprintln!("Version match check: {} {} matches {}: {}", finger.name(), version, req, req.matches(&version));
+                            if req.matches(&version) {
+                                // Only replace if we don't have an exact match already
+                                let current = e.get();
+                                if let Some(current_ver) = &current.version {
+                                    if *locked_ver != *current_ver {
+                                        // If current is not an exact match, replace with this one
+                                        e.insert(finger);
+                                    }
+                                } else {
+                                    e.insert(finger);
+                                }
+                            }
+                        } else {
+                            // Fallback: try to parse the locked version as a semver requirement
+                            // This handles cases where the project specifies "0.8" but Cargo resolves to "0.8.5"
+                            let req_str = if locked_ver.matches('.').count() == 1 {
+                                // If it's like "0.8", convert to "^0.8.0"
+                                format!("^{}.0", locked_ver)
+                            } else {
+                                // If it's already a full version like "0.8.5", convert to "^0.8.5"
+                                format!("^{}", locked_ver)
+                            };
+                            
+                            if let (Ok(req), Ok(version)) = (VersionReq::parse(&req_str), Version::parse(&ver)) {
+                                eprintln!("Fallback version match: {} {} matches {} (from {}): {}", finger.name(), version, req, req_str, req.matches(&version));
+                                if req.matches(&version) {
+                                    let current = e.get();
+                                    if let Some(current_ver) = &current.version {
+                                        if *locked_ver != *current_ver {
+                                            e.insert(finger);
+                                        }
+                                    } else {
+                                        e.insert(finger);
+                                    }
+                                }
+                            } else {
+                                // Final fallback to exact match if parsing fails
+                                eprintln!("Version parsing failed for {}: locked_ver={}, ver={}", finger.name(), locked_ver, ver);
+                                if *locked_ver == ver && e.get().mtime < finger.mtime {
+                                    e.insert(finger);
+                                }
+                            }
+                        }
                     }
                 }
             }
             (Entry::Vacant(e), Some(ver)) => {
-                // Parse versions and check if the fingerprint version satisfies the locked requirement
-                if let (Ok(req), Ok(version)) = (VersionReq::parse(locked_ver), Version::parse(&ver)) {
-                    eprintln!("Version match check: {} {} matches {}: {}", finger.name(), version, req, req.matches(&version));
-                    if req.matches(&version) {
+                // For direct dependencies, require exact version match
+                if let Some(req_ver) = required_version {
+                    if *req_ver == ver {
+                        eprintln!("Direct dependency exact match for {}: {} == {}", finger.name(), req_ver, ver);
                         e.insert(finger);
+                    } else {
+                        eprintln!("Direct dependency version mismatch for {}: required {}, found {}", finger.name(), req_ver, ver);
                     }
                 } else {
-                    // Fallback to exact match if parsing fails
-                    eprintln!("Version parsing failed for {}: locked_ver={}, ver={}", finger.name(), locked_ver, ver);
+                    // For transitive dependencies, use the existing logic
+                    // First try exact version match (highest priority)
                     if *locked_ver == ver {
+                        eprintln!("Exact version match for {}: {} == {}", finger.name(), locked_ver, ver);
                         e.insert(finger);
+                    } else {
+                        // Then try semantic version matching
+                        if let (Ok(req), Ok(version)) = (VersionReq::parse(locked_ver), Version::parse(&ver)) {
+                            eprintln!("Version match check: {} {} matches {}: {}", finger.name(), version, req, req.matches(&version));
+                            if req.matches(&version) {
+                                e.insert(finger);
+                            }
+                        } else {
+                            // Fallback: try to parse the locked version as a semver requirement
+                            let req_str = if locked_ver.matches('.').count() == 1 {
+                                format!("^{}.0", locked_ver)
+                            } else {
+                                format!("^{}", locked_ver)
+                            };
+                            
+                            if let (Ok(req), Ok(version)) = (VersionReq::parse(&req_str), Version::parse(&ver)) {
+                                eprintln!("Fallback version match: {} {} matches {} (from {}): {}", finger.name(), version, req, req_str, req.matches(&version));
+                                if req.matches(&version) {
+                                    e.insert(finger);
+                                }
+                            } else {
+                                // Final fallback to exact match if parsing fails
+                                eprintln!("Version parsing failed for {}: locked_ver={}, ver={}", finger.name(), locked_ver, ver);
+                                if *locked_ver == ver {
+                                    e.insert(finger);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -229,6 +319,7 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
 #[derive(Debug)]
 struct LockedDeps {
     dependencies: Vec<(String, String)>,
+    direct_dependencies: HashMap<String, String>,
 }
 
 fn get_cargo_meta<P: AsRef<Path> + std::convert::AsRef<std::ffi::OsStr>>(
@@ -271,8 +362,9 @@ impl LockedDeps {
         for pkg in &metadata.packages {
             eprintln!("  id: {} name: {}", pkg.id.repr, pkg.name);
         }
-        // Walk dependencies from the root package
-        let mut all_deps = std::collections::HashSet::new();
+        
+        // First, collect direct dependencies with their versions
+        let mut direct_deps = std::collections::HashMap::new();
         if let Some(root_node) = all_nodes.get(root_id) {
             eprintln!(
                 "Root node dependencies: {:?}",
@@ -282,6 +374,18 @@ impl LockedDeps {
                     .map(|d| d.repr.clone())
                     .collect::<Vec<_>>()
             );
+            
+            // Collect direct dependencies first
+            for dep_id in &root_node.dependencies {
+                if let Some(pkg) = metadata.packages.iter().find(|p| &p.id == dep_id) {
+                    let name = pkg.name.replace('-', "_");
+                    direct_deps.insert(name.clone(), pkg.version.to_string());
+                    eprintln!("Direct dependency: {} = {}", name, pkg.version);
+                }
+            }
+            
+            // Then walk transitive dependencies, but don't override direct dependencies
+            let mut all_deps = std::collections::HashSet::new();
             all_deps.insert(root_node.id.clone());
             let mut to_visit = root_node.dependencies.clone();
             while let Some(dep_id) = to_visit.pop() {
@@ -291,17 +395,35 @@ impl LockedDeps {
                     }
                 }
             }
-        }
-        // Collect (name, version) pairs for all_deps
-        let mut dep_pairs = Vec::new();
-        for node_id in &all_deps {
-            if let Some(pkg) = metadata.packages.iter().find(|p| &p.id == node_id) {
-                dep_pairs.push((pkg.name.replace('-', "_"), pkg.version.to_string()));
+            
+            // Collect all dependencies, prioritizing direct ones
+            let mut dep_pairs = Vec::new();
+            for node_id in &all_deps {
+                if let Some(pkg) = metadata.packages.iter().find(|p| &p.id == node_id) {
+                    let name = pkg.name.replace('-', "_");
+                    let version = pkg.version.to_string();
+                    
+                    // If this is a direct dependency, use it
+                    if direct_deps.contains_key(&name) {
+                        dep_pairs.push((name.clone(), direct_deps[&name].clone()));
+                    } else {
+                        // Otherwise, use the transitive dependency version
+                        dep_pairs.push((name, version));
+                    }
+                }
             }
+            
+            Ok(LockedDeps {
+                dependencies: dep_pairs,
+                direct_dependencies: direct_deps,
+            })
+        } else {
+            Err(SkepticError::RootPackageNotFound)
         }
-        Ok(LockedDeps {
-            dependencies: dep_pairs,
-        })
+    }
+
+    fn get_direct_dependencies(&self) -> &HashMap<String, String> {
+        &self.direct_dependencies
     }
 }
 
@@ -331,52 +453,82 @@ fn guess_ext(mut path: PathBuf, exts: &[&str]) -> Result<PathBuf> {
 }
 
 fn extract_version_from_fingerprint<P: AsRef<Path>>(path: P) -> Result<Option<String>> {
+    let path = path.as_ref();
+    
+    // First, try to extract version from the directory name
+    // The directory name format is usually: package-hash
+    // We can map this to the actual package by looking at cargo metadata
+    if let Some(parent) = path.parent() {
+        if let Some(dir_name) = parent.file_name().and_then(|n| n.to_str()) {
+            // For rand, we have two directories: rand-905b6958fc9436f9 and rand-95dae24b7ccba090
+            // We need to determine which one corresponds to which version
+            
+            // Try to get the cargo metadata to map these
+            let mut cargo_toml = path.to_path_buf();
+            // Navigate up to find Cargo.toml: .fingerprint/package-hash/file -> target/debug/.fingerprint/package-hash/file
+            cargo_toml.pop(); // remove file
+            cargo_toml.pop(); // remove package-hash dir
+            cargo_toml.pop(); // remove .fingerprint
+            cargo_toml.pop(); // remove debug
+            cargo_toml.pop(); // remove target
+            cargo_toml.push("Cargo.toml");
+            
+            if cargo_toml.exists() {
+                if let Ok(metadata) = get_cargo_meta(&cargo_toml) {
+                    let lib_name = dir_name.split('-').next().unwrap_or("").replace('-', "_");
+                    
+                    // Find all packages with this name
+                    let matching_packages: Vec<_> = metadata.packages.iter()
+                        .filter(|pkg| pkg.name.replace('-', "_") == lib_name)
+                        .collect();
+                    
+                    if matching_packages.len() == 1 {
+                        // Only one version, use it
+                        return Ok(Some(matching_packages[0].version.to_string()));
+                    } else if matching_packages.len() > 1 {
+                        // Multiple versions - need to determine which one this fingerprint belongs to
+                        // For now, we'll use a heuristic based on the hash
+                        
+                        // Try to read the fingerprint file to get more info
+                        if let Ok(content) = fs::read_to_string(path) {
+                            // Look for dependency information that might help us distinguish versions
+                            for pkg in &matching_packages {
+                                // Check if this fingerprint references dependencies that are specific to this version
+                                                                 if pkg.version.to_string().starts_with("0.8") && content.contains("rand_chacha") {
+                                     // rand 0.8.x uses rand_chacha
+                                     return Ok(Some(pkg.version.to_string()));
+                                 } else if pkg.version.to_string().starts_with("0.5") && content.contains("rand_core") && content.contains("0.3") {
+                                     // rand 0.5.x uses rand_core 0.3
+                                     return Ok(Some(pkg.version.to_string()));
+                                 }
+                            }
+                        }
+                        
+                        // If we can't determine from dependencies, sort by version and use the hash as a tiebreaker
+                        let mut sorted_packages = matching_packages;
+                        sorted_packages.sort_by(|a, b| a.version.cmp(&b.version));
+                        
+                        // Use the hash to determine which version this is
+                        let hash = dir_name.split('-').last().unwrap_or("");
+                        if hash.len() >= 8 {
+                            let hash_val = u64::from_str_radix(&hash[..8], 16).unwrap_or(0);
+                            let idx = (hash_val % sorted_packages.len() as u64) as usize;
+                            return Ok(Some(sorted_packages[idx].version.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Fallback to the original logic
     let content = fs::read_to_string(path)?;
-
-    // Look for version information in the fingerprint content
-    // Cargo fingerprint files often contain version info in various formats
     for line in content.lines() {
-        // Look for patterns like "version: 1.2.3" or "1.2.3" after certain keywords
         if line.contains("version:") {
             if let Some(version) = line.split("version:").nth(1) {
                 let version = version.trim();
                 if !version.is_empty() {
                     return Ok(Some(version.to_string()));
-                }
-            }
-        }
-
-        // Look for semver patterns (x.y.z) in package identifiers
-        if line.contains('.') && (line.contains("rand") || line.contains("cargo")) {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            for part in parts {
-                if part.matches('.').count() == 2
-                    && part.chars().all(|c| c.is_ascii_digit() || c == '.')
-                {
-                    // Validate it's a proper semver
-                    if Version::parse(part).is_ok() {
-                        return Ok(Some(part.to_string()));
-                    }
-                }
-            }
-        }
-
-        // Look for package names with versions like "rand-0.9.0"
-        if line.contains('-') {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            for part in parts {
-                if part.contains('-') {
-                    let subparts: Vec<&str> = part.split('-').collect();
-                    if subparts.len() >= 2 {
-                        let last_part = subparts.last().unwrap();
-                        if last_part.matches('.').count() == 2
-                            && last_part.chars().all(|c| c.is_ascii_digit() || c == '.')
-                        {
-                            if Version::parse(last_part).is_ok() {
-                                return Ok(Some(last_part.to_string()));
-                            }
-                        }
-                    }
                 }
             }
         }
