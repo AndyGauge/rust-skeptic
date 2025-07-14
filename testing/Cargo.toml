@@ -25,6 +25,12 @@ features = ["from"]
 # Dependencies for testing multiple rand versions scenario
 [dependencies]
 rand = "0.8"
-criterion = "0.6"
 oorandom = "11"
+
+# Criterion has Windows linking issues in CI, so make it conditional
+[target.'cfg(not(windows))'.dependencies]
+criterion = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+criterion = { version = "0.6", optional = true }
 

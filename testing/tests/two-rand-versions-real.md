@@ -6,6 +6,7 @@ This test demonstrates a real-world scenario where two different versions of the
 
 ```rust
 extern crate rand;
+#[cfg(not(windows))]
 extern crate criterion;
 extern crate oorandom;
 

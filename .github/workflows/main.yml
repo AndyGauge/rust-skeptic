@@ -30,6 +30,13 @@ jobs:
           profile: minimal
           toolchain: ${{ matrix.rust }}
           override: true
+      - name: Setup Windows environment
+        if: matrix.os == 'windows-latest'
+        run: |
+          # Ensure we have the latest Windows SDK
+          echo "Using Windows SDK from Visual Studio"
+          # Add Windows SDK lib path to environment
+          echo "LIB=%ProgramFiles(x86)%\Windows Kits\10\Lib\10.0.22000.0\um\x64;%ProgramFiles(x86)%\Windows Kits\10\Lib\10.0.22000.0\ucrt\x64;%LIB%" >> $GITHUB_ENV
       - uses: actions-rs/cargo@v1
         with:
           command: build
