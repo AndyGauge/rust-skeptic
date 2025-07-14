@@ -5,7 +5,6 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
 use std::time::SystemTime;
 
 use cargo_metadata::Edition;
@@ -15,18 +14,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use walkdir::WalkDir;
 
-// Type alias to reduce complexity
-type RlibCacheMap = HashMap<(PathBuf, PathBuf), Vec<Fingerprint>>;
-
-// Global cache for rlib dependencies to avoid recomputing for every test
-// Using lazy_static for compatibility with older Rust versions
-lazy_static::lazy_static! {
-    static ref RLIB_CACHE: Mutex<RlibCacheMap> = Mutex::new(HashMap::new());
-}
-
-fn get_rlib_cache() -> &'static Mutex<RlibCacheMap> {
-    &RLIB_CACHE
-}
+// In-memory cache removed as it's redundant with persistent cache
+// and doesn't provide benefits for single-test-per-process execution
 
 // Persistent cache structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -271,16 +260,6 @@ fn interpret_output(mut command: Command) {
 // Retrieve the exact dependencies for a given build by
 // cross-referencing the lockfile with the fingerprint file
 fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<Fingerprint>> {
-    let cache_key = (root_dir.clone(), target_dir.clone());
-
-    // Check in-memory cache first
-    {
-        let cache = get_rlib_cache().lock().unwrap();
-        if let Some(cached_deps) = cache.get(&cache_key) {
-            return Ok(cached_deps.clone());
-        }
-    }
-
     // Check persistent cache
     let cache_key_str = format!("{}:{}", root_dir.display(), target_dir.display());
     let cache_key_hash = PersistentCache::generate_cache_key_hash(&root_dir, &target_dir);
@@ -315,8 +294,6 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
 
         if missing_deps.is_empty() {
             // Cache is valid - all expected dependencies are present
-            let mut cache = get_rlib_cache().lock().unwrap();
-            cache.insert(cache_key.clone(), cached_deps.clone());
             return Ok(cached_deps.clone());
         }
         // If there are missing dependencies, continue to rebuild the cache
@@ -498,12 +475,6 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
         })
         .collect();
 
-    // Cache the result in both in-memory and persistent caches
-    {
-        let mut cache = get_rlib_cache().lock().unwrap();
-        cache.insert(cache_key, result.clone());
-    }
-
     // Save to persistent cache
     persistent_cache.insert(cache_key_str, result.clone(), cache_key_hash);
     if persistent_cache.save_to_file(&root_dir).is_err() {
@@ -516,36 +487,36 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
 
 /// Populate the cache during the build phase to make test runs faster
 pub fn populate_cache_during_build(root_dir: &Path, target_triple: &str) -> Result<()> {
-    // During build script execution, we can use the OUT_DIR environment variable
-    // to determine the target directory structure
+    // Helper function to populate cache for a given target directory
+    fn populate_cache_for_target(root_dir: &Path, target_dir: &Path) -> Result<bool> {
+        if !target_dir.exists() || !target_dir.join(".fingerprint").exists() {
+            return Ok(false);
+        }
+
+        let cache_key_str = format!("{}:{}", root_dir.display(), target_dir.display());
+        let cache_key_hash = PersistentCache::generate_cache_key_hash(root_dir, target_dir);
+
+        // Check if cache is already up to date
+        let persistent_cache = PersistentCache::load_from_file(root_dir)?;
+        if persistent_cache.get(&cache_key_str, cache_key_hash).is_some() {
+            return Ok(true); // Cache is up to date
+        }
+
+        // Populate the cache by calling get_rlib_dependencies
+        let _ = get_rlib_dependencies(root_dir.to_path_buf(), target_dir.to_path_buf())?;
+        Ok(true)
+    }
+
+    // Try to find target directory from OUT_DIR during build script execution
     if let Ok(out_dir) = env::var("OUT_DIR") {
         let out_path = PathBuf::from(&out_dir);
-
-        // OUT_DIR is typically: target/debug/build/package-name-hash/out
-        // We need to go up to find the target directory with .fingerprint
         let mut target_dir = out_path.clone();
 
         // Go up from out_dir to find the target directory
         // OUT_DIR structure: target/{profile}/build/{package}-{hash}/out
         for _ in 0..4 {
             target_dir.pop();
-            if target_dir.join(".fingerprint").exists() {
-                // Found a valid target directory, populate the cache
-                let cache_key_str = format!("{}:{}", root_dir.display(), target_dir.display());
-                let cache_key_hash =
-                    PersistentCache::generate_cache_key_hash(root_dir, &target_dir);
-
-                // Check if cache is already up to date
-                let persistent_cache = PersistentCache::load_from_file(root_dir)?;
-                if persistent_cache
-                    .get(&cache_key_str, cache_key_hash)
-                    .is_some()
-                {
-                    return Ok(());
-                }
-
-                // Populate the cache by calling get_rlib_dependencies
-                let _ = get_rlib_dependencies(root_dir.to_path_buf(), target_dir.clone())?;
+            if populate_cache_for_target(root_dir, &target_dir)? {
                 return Ok(());
             }
         }
@@ -560,22 +531,7 @@ pub fn populate_cache_during_build(root_dir: &Path, target_triple: &str) -> Resu
     ];
 
     for target_dir in &potential_target_dirs {
-        if target_dir.exists() && target_dir.join(".fingerprint").exists() {
-            // Found a valid target directory, populate the cache
-            let cache_key_str = format!("{}:{}", root_dir.display(), target_dir.display());
-            let cache_key_hash = PersistentCache::generate_cache_key_hash(root_dir, target_dir);
-
-            // Check if cache is already up to date
-            let persistent_cache = PersistentCache::load_from_file(root_dir)?;
-            if persistent_cache
-                .get(&cache_key_str, cache_key_hash)
-                .is_some()
-            {
-                return Ok(());
-            }
-
-            // Populate the cache by calling get_rlib_dependencies
-            let _ = get_rlib_dependencies(root_dir.to_path_buf(), target_dir.clone())?;
+        if populate_cache_for_target(root_dir, target_dir)? {
             return Ok(());
         }
     }
