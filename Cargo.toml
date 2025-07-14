@@ -1,7 +1,3 @@
 [workspace]
 members = ["skeptic", "testing"]
 resolver = "2"
-
-# Override windows-sys to use a version compatible with GitHub Actions
-[patch.crates-io]
-windows-sys = { version = "0.48" }
