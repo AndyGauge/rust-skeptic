@@ -14,13 +14,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use walkdir::WalkDir;
 
-// In-memory cache removed as it's redundant with persistent cache
-// and doesn't provide benefits for single-test-per-process execution
-
 // Persistent cache structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistentCache {
-    pub cache_version: u32,
+    pub cache_version: u32, // Defensive versioning to invalidate cache when data format changes
     pub entries: HashMap<String, CacheEntry>,
 }
 
@@ -40,7 +37,7 @@ impl Default for PersistentCache {
 impl PersistentCache {
     pub fn new() -> Self {
         Self {
-            cache_version: 2, // Incremented due to version extraction fix
+            cache_version: 1,
             entries: HashMap::new(),
         }
     }
@@ -58,16 +55,13 @@ impl PersistentCache {
         let data = fs::read(&cache_file)?;
         match bincode::deserialize::<PersistentCache>(&data) {
             Ok(cache) => {
-                // Check if cache version is current
-                if cache.cache_version == 2 {
+                if cache.cache_version == 1 {
                     Ok(cache)
                 } else {
-                    // Cache version is outdated, start fresh
                     Ok(Self::new())
                 }
             }
             Err(_) => {
-                // If deserialization fails, start with a fresh cache
                 Ok(Self::new())
             }
         }
@@ -260,13 +254,11 @@ fn interpret_output(mut command: Command) {
 // Retrieve the exact dependencies for a given build by
 // cross-referencing the lockfile with the fingerprint file
 fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<Fingerprint>> {
-    // Check persistent cache
     let cache_key_str = format!("{}:{}", root_dir.display(), target_dir.display());
     let cache_key_hash = PersistentCache::generate_cache_key_hash(&root_dir, &target_dir);
 
     let mut persistent_cache = PersistentCache::load_from_file(&root_dir)?;
 
-    // Load Cargo.lock to get expected dependencies
     let lock = LockedDeps::from_path(root_dir.clone()).or_else(|_| {
         // could not find Cargo.lock in $CARGO_MAINFEST_DIR
         // try relative to target_dir
@@ -296,7 +288,6 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
             // Cache is valid - all expected dependencies are present
             return Ok(cached_deps.clone());
         }
-        // If there are missing dependencies, continue to rebuild the cache
     }
 
     let fingerprint_dir = target_dir.join(".fingerprint/");
@@ -314,10 +305,8 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
         .map(|entry| entry.path().to_owned())
         .collect();
     
-    // Sort paths for consistent ordering across platforms
     fingerprint_paths.sort();
 
-    // Process fingerprints sequentially for deterministic behavior
     let fingerprints: Vec<_> = fingerprint_paths
         .iter()
         .filter_map(|path| Fingerprint::from_path(path, metadata.as_ref()).ok())
@@ -336,12 +325,6 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
         } else {
             None
         };
-
-
-
-
-
-        // Improved version matching logic with semantic versioning
         match (found_deps.entry(finger.name()), finger.version()) {
             (Entry::Occupied(mut e), Some(ver)) => {
                 // For direct dependencies, require exact version match
@@ -412,12 +395,9 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
                         e.insert(finger);
                     }
                 } else {
-                    // For transitive dependencies, use the existing logic
-                    // First try exact version match (highest priority)
                     if *locked_ver == ver {
                         e.insert(finger);
                     } else {
-                        // Then try semantic version matching
                         if let (Ok(req), Ok(version)) =
                             (VersionReq::parse(locked_ver), Version::parse(&ver))
                         {
@@ -425,7 +405,6 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
                                 e.insert(finger);
                             }
                         } else {
-                            // Fallback: try to parse the locked version as a semver requirement
                             let req_str = if locked_ver.matches('.').count() == 1 {
                                 format!("^{}.0", locked_ver)
                             } else {
@@ -439,7 +418,6 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
                                     e.insert(finger);
                                 }
                             } else {
-                                // Final fallback to exact match if parsing fails
                                 if *locked_ver == ver {
                                     e.insert(finger);
                                 }
@@ -478,8 +456,6 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
     // Save to persistent cache
     persistent_cache.insert(cache_key_str, result.clone(), cache_key_hash);
     if persistent_cache.save_to_file(&root_dir).is_err() {
-        // Don't fail the entire operation if we can't save the cache
-        // This is non-fatal since the operation completed successfully
     }
 
     Ok(result)
@@ -487,7 +463,6 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
 
 /// Populate the cache during the build phase to make test runs faster
 pub fn populate_cache_during_build(root_dir: &Path, target_triple: &str) -> Result<()> {
-    // Helper function to populate cache for a given target directory
     fn populate_cache_for_target(root_dir: &Path, target_dir: &Path) -> Result<bool> {
         if !target_dir.exists() || !target_dir.join(".fingerprint").exists() {
             return Ok(false);
@@ -496,13 +471,11 @@ pub fn populate_cache_during_build(root_dir: &Path, target_triple: &str) -> Resu
         let cache_key_str = format!("{}:{}", root_dir.display(), target_dir.display());
         let cache_key_hash = PersistentCache::generate_cache_key_hash(root_dir, target_dir);
 
-        // Check if cache is already up to date
         let persistent_cache = PersistentCache::load_from_file(root_dir)?;
         if persistent_cache.get(&cache_key_str, cache_key_hash).is_some() {
-            return Ok(true); // Cache is up to date
+            return Ok(true);
         }
 
-        // Populate the cache by calling get_rlib_dependencies
         let _ = get_rlib_dependencies(root_dir.to_path_buf(), target_dir.to_path_buf())?;
         Ok(true)
     }
