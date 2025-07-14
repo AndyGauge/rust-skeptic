@@ -32,11 +32,25 @@ jobs:
           override: true
       - name: Setup Windows environment
         if: matrix.os == 'windows-latest'
+        shell: powershell
         run: |
-          # Ensure we have the latest Windows SDK
-          echo "Using Windows SDK from Visual Studio"
-          # Add Windows SDK lib path to environment
-          echo "LIB=%ProgramFiles(x86)%\Windows Kits\10\Lib\10.0.22000.0\um\x64;%ProgramFiles(x86)%\Windows Kits\10\Lib\10.0.22000.0\ucrt\x64;%LIB%" >> $GITHUB_ENV
+          # Install missing Windows SDK components
+          $sdkPath = "${env:ProgramFiles(x86)}\Windows Kits\10\Lib"
+          Write-Host "Available Windows SDK versions:"
+          if (Test-Path $sdkPath) {
+            Get-ChildItem $sdkPath | Where-Object { $_.PSIsContainer } | ForEach-Object { Write-Host $_.Name }
+          }
+          
+          # Find the latest available Windows SDK
+          $latestSdk = Get-ChildItem "$sdkPath" | Where-Object { $_.PSIsContainer -and $_.Name -like "10.0.*" } | Sort-Object Name -Descending | Select-Object -First 1
+          if ($latestSdk) {
+            $sdkVersion = $latestSdk.Name
+            Write-Host "Using Windows SDK version: $sdkVersion"
+            $libPath = "${env:ProgramFiles(x86)}\Windows Kits\10\Lib\$sdkVersion\um\x64;${env:ProgramFiles(x86)}\Windows Kits\10\Lib\$sdkVersion\ucrt\x64"
+            echo "LIB=$libPath;$env:LIB" >> $env:GITHUB_ENV
+          } else {
+            Write-Host "No Windows SDK found, using default"
+          }
       - uses: actions-rs/cargo@v1
         with:
           command: build
