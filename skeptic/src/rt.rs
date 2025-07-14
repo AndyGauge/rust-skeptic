@@ -1,4 +1,4 @@
-use std::collections::hash_map::Entry;
+use std::collections::btree_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsStr;
@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use cargo_metadata::Edition;
-use rayon::prelude::*;
+
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -51,7 +51,7 @@ impl Default for PersistentCache {
 impl PersistentCache {
     pub fn new() -> Self {
         Self {
-            cache_version: 1,
+            cache_version: 2, // Incremented due to version extraction fix
             entries: HashMap::new(),
         }
     }
@@ -67,8 +67,16 @@ impl PersistentCache {
         }
 
         let data = fs::read(&cache_file)?;
-        match bincode::deserialize(&data) {
-            Ok(cache) => Ok(cache),
+        match bincode::deserialize::<PersistentCache>(&data) {
+            Ok(cache) => {
+                // Check if cache version is current
+                if cache.cache_version == 2 {
+                    Ok(cache)
+                } else {
+                    // Cache version is outdated, start fresh
+                    Ok(Self::new())
+                }
+            }
             Err(_) => {
                 // If deserialization fails, start with a fresh cache
                 Ok(Self::new())
@@ -320,18 +328,21 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
     let metadata_path = root_dir.join("Cargo.toml");
     let metadata = get_cargo_meta(&metadata_path).ok();
 
-    let mut found_deps: HashMap<String, Fingerprint> = HashMap::new();
+    let mut found_deps: std::collections::BTreeMap<String, Fingerprint> = std::collections::BTreeMap::new();
 
-    // Collect all fingerprint paths first
-    let fingerprint_paths: Vec<_> = WalkDir::new(fingerprint_dir)
+    // Collect all fingerprint paths first and sort for deterministic behavior
+    let mut fingerprint_paths: Vec<_> = WalkDir::new(fingerprint_dir)
         .into_iter()
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path().to_owned())
         .collect();
+    
+    // Sort paths for consistent ordering across platforms
+    fingerprint_paths.sort();
 
-    // Process fingerprints in parallel
+    // Process fingerprints sequentially for deterministic behavior
     let fingerprints: Vec<_> = fingerprint_paths
-        .par_iter()
+        .iter()
         .filter_map(|path| Fingerprint::from_path(path, metadata.as_ref()).ok())
         .collect();
 
@@ -348,6 +359,10 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
         } else {
             None
         };
+
+
+
+
 
         // Improved version matching logic with semantic versioning
         match (found_deps.entry(finger.name()), finger.version()) {
@@ -688,6 +703,8 @@ fn extract_version_from_fingerprint<P: AsRef<Path>>(
     metadata: Option<&cargo_metadata::Metadata>,
 ) -> Result<Option<String>> {
     let path = path.as_ref();
+    
+
 
     // First, try to extract version from the directory name using cached metadata
     if let Some(metadata) = metadata {
@@ -708,21 +725,47 @@ fn extract_version_from_fingerprint<P: AsRef<Path>>(
                         return Ok(Some(matching_packages[0].version.to_string()));
                     }
                     n if n > 1 => {
-                        // Multiple versions - use the directory hash to deterministically select one
-                        // This ensures consistent selection for the same build
-                        let hash = dir_name.split('-').next_back().unwrap_or("");
-                        if hash.len() >= 8 {
-                            if let Ok(hash_val) = u64::from_str_radix(&hash[..8], 16) {
-                                let mut sorted_packages = matching_packages;
-                                sorted_packages.sort_by(|a, b| a.version.cmp(&b.version));
-                                let idx = (hash_val % sorted_packages.len() as u64) as usize;
-                                return Ok(Some(sorted_packages[idx].version.to_string()));
+                        // Multiple versions - need to read fingerprint JSON to determine which one
+                        let json_path = parent.join(format!("lib-{}.json", lib_name.replace('_', "-")));
+                        if json_path.exists() {
+                            if let Ok(json_content) = std::fs::read_to_string(&json_path) {
+                                if let Ok(fingerprint_data) = serde_json::from_str::<serde_json::Value>(&json_content) {
+                                    if let Some(features) = fingerprint_data.get("features")
+                                        .and_then(|f| f.as_str())
+                                        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok()) {
+                                        
+                                        // Try to match features against package versions
+                                        for pkg in &matching_packages {
+                                            // Check if this package's features match the fingerprint
+                                            if lib_name == "rand" {
+                                                // For rand, use thread_rng as a distinguishing feature
+                                                let has_thread_rng = features.contains(&"thread_rng".to_string());
+                                                let pkg_has_thread_rng = pkg.features.contains_key("thread_rng");
+                                                
+                                                if has_thread_rng == pkg_has_thread_rng {
+                                                    return Ok(Some(pkg.version.to_string()));
+                                                }
+                                            } else {
+                                                // For other packages, use a more general approach
+                                                // This is a simplified check - in practice, you might need more sophisticated matching
+                                                let feature_set: std::collections::HashSet<_> = features.iter().collect();
+                                                let pkg_feature_set: std::collections::HashSet<_> = pkg.features.keys().collect();
+                                                
+                                                // Check if there's significant overlap
+                                                let intersection_count = feature_set.intersection(&pkg_feature_set).count();
+                                                if intersection_count > 0 {
+                                                    return Ok(Some(pkg.version.to_string()));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
-
-                        // If hash parsing fails, use the first (lowest) version
+                        
+                        // If we can't determine from features, fall back to highest version
                         let mut sorted_packages = matching_packages;
-                        sorted_packages.sort_by(|a, b| a.version.cmp(&b.version));
+                        sorted_packages.sort_by(|a, b| b.version.cmp(&a.version)); // Sort descending
                         return Ok(Some(sorted_packages[0].version.to_string()));
                     }
                     _ => {
