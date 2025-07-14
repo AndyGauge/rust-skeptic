@@ -264,15 +264,8 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
     let cache_key_hash = PersistentCache::generate_cache_key_hash(&root_dir, &target_dir);
     
     let mut persistent_cache = PersistentCache::load_from_file(&root_dir)?;
-    if let Some(cached_deps) = persistent_cache.get(&cache_key_str, cache_key_hash) {
-        // Also populate the in-memory cache
-        {
-            let mut cache = get_rlib_cache().lock().unwrap();
-            cache.insert(cache_key.clone(), cached_deps.clone());
-        }
-        return Ok(cached_deps.clone());
-    }
-
+    
+    // Load Cargo.lock to get expected dependencies
     let lock = LockedDeps::from_path(root_dir.clone()).or_else(|_| {
         // could not find Cargo.lock in $CARGO_MAINFEST_DIR
         // try relative to target_dir
@@ -281,159 +274,57 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
         root_dir.pop();
         LockedDeps::from_path(root_dir)
     })?;
+    
+    let locked_deps: HashMap<String, String> = lock.collect();
+    
+    // Check if cached dependencies are still valid by ensuring all locked dependencies are present
+    if let Some(cached_deps) = persistent_cache.get(&cache_key_str, cache_key_hash) {
+        let cached_dep_names: HashSet<String> = cached_deps.iter().map(|d| d.name().to_string()).collect();
+        let missing_deps: Vec<&String> = locked_deps.keys()
+            .filter(|dep_name| !cached_dep_names.contains(*dep_name))
+            .collect();
+        
+        if missing_deps.is_empty() {
+            // Cache is valid - all expected dependencies are present
+            let mut cache = get_rlib_cache().lock().unwrap();
+            cache.insert(cache_key.clone(), cached_deps.clone());
+            return Ok(cached_deps.clone());
+        } else {
+            // Cache is invalid - some dependencies are missing, need to rebuild
+            // Continue to rebuild the dependency list
+        }
+    }
 
     let fingerprint_dir = target_dir.join(".fingerprint/");
 
     // Get direct dependencies first before consuming the lock
     let direct_deps = lock.get_direct_dependencies().clone();
-    let locked_deps: HashMap<String, String> = lock.collect();
-
+    
     // Get cargo metadata once and reuse it for all fingerprints
     let metadata_path = root_dir.join("Cargo.toml");
-    let metadata = get_cargo_meta(&metadata_path).ok();
+    let metadata = cargo_metadata::MetadataCommand::new()
+        .manifest_path(&metadata_path)
+        .exec()
+        .map_err(|e| format!("Failed to get cargo metadata: {}", e))?;
 
-    let mut found_deps: HashMap<String, Fingerprint> = HashMap::new();
+    let mut found_deps = HashMap::new();
 
-    // Collect all fingerprint paths first
-    let fingerprint_paths: Vec<_> = WalkDir::new(fingerprint_dir)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path().to_owned())
-        .collect();
-
-    // Process fingerprints in parallel
-    let fingerprints: Vec<_> = fingerprint_paths
-        .par_iter()
-        .filter_map(|path| Fingerprint::from_path(path, metadata.as_ref()).ok())
-        .collect();
-
-    for finger in fingerprints {
-        let locked_ver = match locked_deps.get(&finger.name()) {
-            Some(ver) => ver,
-            None => continue,
-        };
-
-        // Check if this is a direct dependency that requires strict version matching
-        let is_direct_dep = direct_deps.contains_key(&finger.name());
-        let required_version = if is_direct_dep {
-            Some(&direct_deps[&finger.name()])
-        } else {
-            None
-        };
-
-        // Improved version matching logic with semantic versioning
-        match (found_deps.entry(finger.name()), finger.version()) {
-            (Entry::Occupied(mut e), Some(ver)) => {
-                // For direct dependencies, require exact version match
-                if let Some(req_ver) = required_version {
-                    if *req_ver == ver {
-                        e.insert(finger);
-                    }
-                } else {
-                    // For transitive dependencies, use the existing logic
-                    // First try exact version match (highest priority)
-                    if *locked_ver == ver {
-                        e.insert(finger);
-                    } else {
-                        // Then try semantic version matching
-                        if let (Ok(req), Ok(version)) = (VersionReq::parse(locked_ver), Version::parse(&ver)) {
-                            if req.matches(&version) {
-                                // Only replace if we don't have an exact match already
-                                let current = e.get();
-                                if let Some(current_ver) = &current.version {
-                                    if *locked_ver != *current_ver {
-                                        // If current is not an exact match, replace with this one
-                                        e.insert(finger);
-                                    }
-                                } else {
-                                    e.insert(finger);
-                                }
-                            }
-                        } else {
-                            // Fallback: try to parse the locked version as a semver requirement
-                            // This handles cases where the project specifies "0.8" but Cargo resolves to "0.8.5"
-                            let req_str = if locked_ver.matches('.').count() == 1 {
-                                // If it's like "0.8", convert to "^0.8.0"
-                                format!("^{}.0", locked_ver)
-                            } else {
-                                // If it's already a full version like "0.8.5", convert to "^0.8.5"
-                                format!("^{}", locked_ver)
-                            };
-                            
-                            if let (Ok(req), Ok(version)) = (VersionReq::parse(&req_str), Version::parse(&ver)) {
-                                if req.matches(&version) {
-                                    let current = e.get();
-                                    if let Some(current_ver) = &current.version {
-                                        if *locked_ver != *current_ver {
-                                            e.insert(finger);
-                                        }
-                                    } else {
-                                        e.insert(finger);
-                                    }
-                                }
-                            } else {
-                                // Final fallback to exact match if parsing fails
-                                if *locked_ver == ver && e.get().mtime < finger.mtime {
-                                    e.insert(finger);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            (Entry::Vacant(e), Some(ver)) => {
-                // For direct dependencies, require exact version match
-                if let Some(req_ver) = required_version {
-                    if *req_ver == ver {
-                        e.insert(finger);
-                    }
-                } else {
-                    // For transitive dependencies, use the existing logic
-                    // First try exact version match (highest priority)
-                    if *locked_ver == ver {
-                        e.insert(finger);
-                    } else {
-                        // Then try semantic version matching
-                        if let (Ok(req), Ok(version)) = (VersionReq::parse(locked_ver), Version::parse(&ver)) {
-                            if req.matches(&version) {
-                                e.insert(finger);
-                            }
-                        } else {
-                            // Fallback: try to parse the locked version as a semver requirement
-                            let req_str = if locked_ver.matches('.').count() == 1 {
-                                format!("^{}.0", locked_ver)
-                            } else {
-                                format!("^{}", locked_ver)
-                            };
-                            
-                            if let (Ok(req), Ok(version)) = (VersionReq::parse(&req_str), Version::parse(&ver)) {
-                                if req.matches(&version) {
-                                    e.insert(finger);
-                                }
-                            } else {
-                                // Final fallback to exact match if parsing fails
-                                if *locked_ver == ver {
-                                    e.insert(finger);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            (Entry::Vacant(e), None) => {
-                // For unversioned entries, insert them (they might be workspace members)
-                e.insert(finger);
-            }
-            (Entry::Occupied(_), None) => {
-                // If we already have an entry and this one is unversioned, skip it
-                // This prevents unversioned entries from overriding versioned ones
-            }
+    for (name, version) in &locked_deps {
+        if let Some(fp) = find_fingerprint(&fingerprint_dir, name, version, &metadata) {
+            found_deps.insert(name.clone(), fp);
         }
     }
 
     let result: Vec<Fingerprint> = found_deps
         .into_iter()
-        .filter_map(|(_, val)| if val.rlib.exists() { Some(val) } else { None })
+        .filter_map(|(name, val)| {
+            if val.rlib.exists() {
+                Some(val)
+            } else {
+                eprintln!("Warning: rlib does not exist for {}: {}", name, val.rlib.display());
+                None
+            }
+        })
         .collect();
     
     // Cache the result in both in-memory and persistent caches
@@ -442,13 +333,9 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
         cache.insert(cache_key, result.clone());
     }
     
-    // Save to persistent cache
-    persistent_cache.insert(cache_key_str, result.clone(), cache_key_hash);
-    if persistent_cache.save_to_file(&root_dir).is_err() {
-        // Don't fail the entire operation if we can't save the cache
-        // This is non-fatal since the operation completed successfully
-    }
-    
+    persistent_cache.insert(cache_key_str, cache_key_hash, result.clone());
+    persistent_cache.save_to_file(&root_dir)?;
+
     Ok(result)
 }
 
