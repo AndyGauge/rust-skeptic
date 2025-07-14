@@ -133,13 +133,17 @@ struct Config {
 
 fn run(config: &Config) {
     let tests = extract_tests(config).unwrap();
-    
+
     // Pre-populate the cache during build phase
-    if let Err(e) = crate::rt::populate_cache_during_build(&config.root_dir, &config.target_triple) {
+    if let Err(e) = crate::rt::populate_cache_during_build(&config.root_dir, &config.target_triple)
+    {
         // Don't fail the build if cache population fails, just warn
-        eprintln!("Warning: Failed to populate skeptic cache during build: {}", e);
+        eprintln!(
+            "Warning: Failed to populate skeptic cache during build: {}",
+            e
+        );
     }
-    
+
     emit_tests(config, tests).unwrap();
 }
 

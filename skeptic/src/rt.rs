@@ -42,6 +42,12 @@ pub struct CacheEntry {
     created_at: SystemTime,
 }
 
+impl Default for PersistentCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PersistentCache {
     pub fn new() -> Self {
         Self {
@@ -49,17 +55,17 @@ impl PersistentCache {
             entries: HashMap::new(),
         }
     }
-    
+
     pub fn get_cache_file_path(root_dir: &Path) -> PathBuf {
         root_dir.join(".skeptic-cache")
     }
-    
+
     pub fn load_from_file(root_dir: &Path) -> Result<Self> {
         let cache_file = Self::get_cache_file_path(root_dir);
         if !cache_file.exists() {
             return Ok(Self::new());
         }
-        
+
         let data = fs::read(&cache_file)?;
         match bincode::deserialize(&data) {
             Ok(cache) => Ok(cache),
@@ -69,43 +75,46 @@ impl PersistentCache {
             }
         }
     }
-    
+
     pub fn save_to_file(&self, root_dir: &Path) -> Result<()> {
         let cache_file = Self::get_cache_file_path(root_dir);
-        let data = bincode::serialize(self).map_err(|e| SkepticError::Io(
-            std::io::Error::new(std::io::ErrorKind::Other, format!("Serialization error: {}", e))
-        ))?;
+        let data = bincode::serialize(self).map_err(|e| {
+            SkepticError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Serialization error: {}", e),
+            ))
+        })?;
         fs::write(&cache_file, data)?;
         Ok(())
     }
-    
+
     pub fn generate_cache_key_hash(root_dir: &Path, target_dir: &Path) -> u64 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
-        
+
         let mut hasher = DefaultHasher::new();
-        
+
         // Hash the paths
         root_dir.hash(&mut hasher);
         target_dir.hash(&mut hasher);
-        
+
         // Hash the Cargo.toml modification time if it exists
         if let Ok(metadata) = fs::metadata(root_dir.join("Cargo.toml")) {
             if let Ok(modified) = metadata.modified() {
                 modified.hash(&mut hasher);
             }
         }
-        
+
         // Hash the Cargo.lock modification time if it exists
         if let Ok(metadata) = fs::metadata(root_dir.join("Cargo.lock")) {
             if let Ok(modified) = metadata.modified() {
                 modified.hash(&mut hasher);
             }
         }
-        
+
         hasher.finish()
     }
-    
+
     pub fn get(&self, cache_key: &str, expected_hash: u64) -> Option<&Vec<Fingerprint>> {
         if let Some(entry) = self.entries.get(cache_key) {
             if entry.cache_key_hash == expected_hash {
@@ -119,8 +128,13 @@ impl PersistentCache {
         }
         None
     }
-    
-    pub fn insert(&mut self, cache_key: String, fingerprints: Vec<Fingerprint>, cache_key_hash: u64) {
+
+    pub fn insert(
+        &mut self,
+        cache_key: String,
+        fingerprints: Vec<Fingerprint>,
+        cache_key_hash: u64,
+    ) {
         let entry = CacheEntry {
             fingerprints,
             cache_key_hash,
@@ -250,7 +264,7 @@ fn interpret_output(mut command: Command) {
 // cross-referencing the lockfile with the fingerprint file
 fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<Fingerprint>> {
     let cache_key = (root_dir.clone(), target_dir.clone());
-    
+
     // Check in-memory cache first
     {
         let cache = get_rlib_cache().lock().unwrap();
@@ -258,13 +272,13 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
             return Ok(cached_deps.clone());
         }
     }
-    
+
     // Check persistent cache
     let cache_key_str = format!("{}:{}", root_dir.display(), target_dir.display());
     let cache_key_hash = PersistentCache::generate_cache_key_hash(&root_dir, &target_dir);
-    
+
     let mut persistent_cache = PersistentCache::load_from_file(&root_dir)?;
-    
+
     // Load Cargo.lock to get expected dependencies
     let lock = LockedDeps::from_path(root_dir.clone()).or_else(|_| {
         // could not find Cargo.lock in $CARGO_MAINFEST_DIR
@@ -274,21 +288,23 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
         root_dir.pop();
         LockedDeps::from_path(root_dir)
     })?;
-    
+
     // Get direct dependencies first before consuming the lock
     let direct_deps = lock.get_direct_dependencies().clone();
     let locked_deps: HashMap<String, String> = lock.collect();
-    
+
     // Check if cached dependencies are still valid by ensuring key dependencies are present
     // This helps detect when new dependencies have been added to Cargo.lock
     if let Some(cached_deps) = persistent_cache.get(&cache_key_str, cache_key_hash) {
-        let cached_dep_names: HashSet<String> = cached_deps.iter().map(|d| d.name().to_string()).collect();
-        
+        let cached_dep_names: HashSet<String> =
+            cached_deps.iter().map(|d| d.name().to_string()).collect();
+
         // Check if all locked dependencies are represented in the cache
-        let missing_deps: Vec<&String> = locked_deps.keys()
+        let missing_deps: Vec<&String> = locked_deps
+            .keys()
             .filter(|dep_name| !cached_dep_names.contains(*dep_name))
             .collect();
-        
+
         if missing_deps.is_empty() {
             // Cache is valid - all expected dependencies are present
             let mut cache = get_rlib_cache().lock().unwrap();
@@ -316,16 +332,9 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
     // Process fingerprints in parallel
     let fingerprints: Vec<_> = fingerprint_paths
         .par_iter()
-        .filter_map(|path| {
-            match Fingerprint::from_path(path, metadata.as_ref()) {
-                Ok(fp) => Some(fp),
-                Err(_) => None
-            }
-        })
+        .filter_map(|path| Fingerprint::from_path(path, metadata.as_ref()).ok())
         .collect();
 
-
-    
     for finger in fingerprints {
         let locked_ver = match locked_deps.get(&finger.name()) {
             Some(ver) => ver,
@@ -339,8 +348,6 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
         } else {
             None
         };
-        
-
 
         // Improved version matching logic with semantic versioning
         match (found_deps.entry(finger.name()), finger.version()) {
@@ -357,7 +364,9 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
                         e.insert(finger);
                     } else {
                         // Then try semantic version matching
-                        if let (Ok(req), Ok(version)) = (VersionReq::parse(locked_ver), Version::parse(&ver)) {
+                        if let (Ok(req), Ok(version)) =
+                            (VersionReq::parse(locked_ver), Version::parse(&ver))
+                        {
                             if req.matches(&version) {
                                 // Only replace if we don't have an exact match already
                                 let current = e.get();
@@ -380,8 +389,10 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
                                 // If it's already a full version like "0.8.5", convert to "^0.8.5"
                                 format!("^{}", locked_ver)
                             };
-                            
-                            if let (Ok(req), Ok(version)) = (VersionReq::parse(&req_str), Version::parse(&ver)) {
+
+                            if let (Ok(req), Ok(version)) =
+                                (VersionReq::parse(&req_str), Version::parse(&ver))
+                            {
                                 if req.matches(&version) {
                                     let current = e.get();
                                     if let Some(current_ver) = &current.version {
@@ -415,7 +426,9 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
                         e.insert(finger);
                     } else {
                         // Then try semantic version matching
-                        if let (Ok(req), Ok(version)) = (VersionReq::parse(locked_ver), Version::parse(&ver)) {
+                        if let (Ok(req), Ok(version)) =
+                            (VersionReq::parse(locked_ver), Version::parse(&ver))
+                        {
                             if req.matches(&version) {
                                 e.insert(finger);
                             }
@@ -426,8 +439,10 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
                             } else {
                                 format!("^{}", locked_ver)
                             };
-                            
-                            if let (Ok(req), Ok(version)) = (VersionReq::parse(&req_str), Version::parse(&ver)) {
+
+                            if let (Ok(req), Ok(version)) =
+                                (VersionReq::parse(&req_str), Version::parse(&ver))
+                            {
                                 if req.matches(&version) {
                                     e.insert(finger);
                                 }
@@ -452,26 +467,28 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
         }
     }
 
-
-    
     let result: Vec<Fingerprint> = found_deps
         .into_iter()
         .filter_map(|(name, val)| {
             if val.rlib.exists() {
                 Some(val)
             } else {
-                eprintln!("Warning: rlib does not exist for {}: {}", name, val.rlib.display());
+                eprintln!(
+                    "Warning: rlib does not exist for {}: {}",
+                    name,
+                    val.rlib.display()
+                );
                 None
             }
         })
         .collect();
-    
+
     // Cache the result in both in-memory and persistent caches
     {
         let mut cache = get_rlib_cache().lock().unwrap();
         cache.insert(cache_key, result.clone());
     }
-    
+
     // Save to persistent cache
     persistent_cache.insert(cache_key_str, result.clone(), cache_key_hash);
     if persistent_cache.save_to_file(&root_dir).is_err() {
@@ -488,11 +505,11 @@ pub fn populate_cache_during_build(root_dir: &Path, target_triple: &str) -> Resu
     // to determine the target directory structure
     if let Ok(out_dir) = env::var("OUT_DIR") {
         let out_path = PathBuf::from(&out_dir);
-        
+
         // OUT_DIR is typically: target/debug/build/package-name-hash/out
         // We need to go up to find the target directory with .fingerprint
         let mut target_dir = out_path.clone();
-        
+
         // Go up from out_dir to find the target directory
         // OUT_DIR structure: target/{profile}/build/{package}-{hash}/out
         for _ in 0..4 {
@@ -500,22 +517,25 @@ pub fn populate_cache_during_build(root_dir: &Path, target_triple: &str) -> Resu
             if target_dir.join(".fingerprint").exists() {
                 // Found a valid target directory, populate the cache
                 let cache_key_str = format!("{}:{}", root_dir.display(), target_dir.display());
-                let cache_key_hash = PersistentCache::generate_cache_key_hash(root_dir, &target_dir);
-                
+                let cache_key_hash =
+                    PersistentCache::generate_cache_key_hash(root_dir, &target_dir);
+
                 // Check if cache is already up to date
                 let persistent_cache = PersistentCache::load_from_file(root_dir)?;
-                if persistent_cache.get(&cache_key_str, cache_key_hash).is_some() {
+                if persistent_cache
+                    .get(&cache_key_str, cache_key_hash)
+                    .is_some()
+                {
                     return Ok(());
                 }
-                
+
                 // Populate the cache by calling get_rlib_dependencies
                 let _ = get_rlib_dependencies(root_dir.to_path_buf(), target_dir.clone())?;
                 return Ok(());
             }
         }
-        
     }
-    
+
     // Fallback: try the traditional locations
     let potential_target_dirs = [
         root_dir.join("target").join(target_triple).join("debug"),
@@ -523,25 +543,28 @@ pub fn populate_cache_during_build(root_dir: &Path, target_triple: &str) -> Resu
         root_dir.join("target").join("debug"),
         root_dir.join("target").join("release"),
     ];
-    
+
     for target_dir in &potential_target_dirs {
         if target_dir.exists() && target_dir.join(".fingerprint").exists() {
             // Found a valid target directory, populate the cache
             let cache_key_str = format!("{}:{}", root_dir.display(), target_dir.display());
             let cache_key_hash = PersistentCache::generate_cache_key_hash(root_dir, target_dir);
-            
+
             // Check if cache is already up to date
             let persistent_cache = PersistentCache::load_from_file(root_dir)?;
-            if persistent_cache.get(&cache_key_str, cache_key_hash).is_some() {
+            if persistent_cache
+                .get(&cache_key_str, cache_key_hash)
+                .is_some()
+            {
                 return Ok(());
             }
-            
+
             // Populate the cache by calling get_rlib_dependencies
             let _ = get_rlib_dependencies(root_dir.to_path_buf(), target_dir.clone())?;
             return Ok(());
         }
     }
-    
+
     Ok(())
 }
 
@@ -580,7 +603,7 @@ impl LockedDeps {
             .find(|pkg| pkg.manifest_path.as_str() == path.to_str().unwrap())
             .ok_or(SkepticError::RootPackageNotFound)?;
         let root_id = &root_package.id;
-        
+
         // First, collect direct dependencies with their versions
         let mut direct_deps = std::collections::HashMap::new();
         if let Some(root_node) = all_nodes.get(root_id) {
@@ -591,7 +614,7 @@ impl LockedDeps {
                     direct_deps.insert(name.clone(), pkg.version.to_string());
                 }
             }
-            
+
             // Then walk transitive dependencies, but don't override direct dependencies
             let mut all_deps = std::collections::HashSet::new();
             all_deps.insert(root_node.id.clone());
@@ -603,14 +626,14 @@ impl LockedDeps {
                     }
                 }
             }
-            
+
             // Collect all dependencies, prioritizing direct ones
             let mut dep_pairs = Vec::new();
             for node_id in &all_deps {
                 if let Some(pkg) = metadata.packages.iter().find(|p| &p.id == node_id) {
                     let name = pkg.name.replace('-', "_");
                     let version = pkg.version.to_string();
-                    
+
                     // If this is a direct dependency, use it
                     if direct_deps.contains_key(&name) {
                         dep_pairs.push((name.clone(), direct_deps[&name].clone()));
@@ -620,7 +643,7 @@ impl LockedDeps {
                     }
                 }
             }
-            
+
             Ok(LockedDeps {
                 dependencies: dep_pairs,
                 direct_dependencies: direct_deps,
@@ -660,20 +683,25 @@ fn guess_ext(mut path: PathBuf, exts: &[&str]) -> Result<PathBuf> {
     Err(SkepticError::Fingerprint)
 }
 
-fn extract_version_from_fingerprint<P: AsRef<Path>>(path: P, metadata: Option<&cargo_metadata::Metadata>) -> Result<Option<String>> {
+fn extract_version_from_fingerprint<P: AsRef<Path>>(
+    path: P,
+    metadata: Option<&cargo_metadata::Metadata>,
+) -> Result<Option<String>> {
     let path = path.as_ref();
-    
+
     // First, try to extract version from the directory name using cached metadata
     if let Some(metadata) = metadata {
         if let Some(parent) = path.parent() {
             if let Some(dir_name) = parent.file_name().and_then(|n| n.to_str()) {
                 let lib_name = dir_name.split('-').next().unwrap_or("").replace('-', "_");
-                
+
                 // Find all packages with this name
-                let matching_packages: Vec<_> = metadata.packages.iter()
+                let matching_packages: Vec<_> = metadata
+                    .packages
+                    .iter()
                     .filter(|pkg| pkg.name.replace('-', "_") == lib_name)
                     .collect();
-                
+
                 match matching_packages.len() {
                     1 => {
                         // Only one version, use it
@@ -691,7 +719,7 @@ fn extract_version_from_fingerprint<P: AsRef<Path>>(path: P, metadata: Option<&c
                                 return Ok(Some(sorted_packages[idx].version.to_string()));
                             }
                         }
-                        
+
                         // If hash parsing fails, use the first (lowest) version
                         let mut sorted_packages = matching_packages;
                         sorted_packages.sort_by(|a, b| a.version.cmp(&b.version));
@@ -704,7 +732,7 @@ fn extract_version_from_fingerprint<P: AsRef<Path>>(path: P, metadata: Option<&c
             }
         }
     }
-    
+
     // Fallback to the original logic - try to find version in the fingerprint file
     if let Ok(content) = fs::read_to_string(path) {
         for line in content.lines() {
@@ -723,7 +751,10 @@ fn extract_version_from_fingerprint<P: AsRef<Path>>(path: P, metadata: Option<&c
 }
 
 impl Fingerprint {
-    pub fn from_path<P: AsRef<Path>>(path: P, metadata: Option<&cargo_metadata::Metadata>) -> Result<Fingerprint> {
+    pub fn from_path<P: AsRef<Path>>(
+        path: P,
+        metadata: Option<&cargo_metadata::Metadata>,
+    ) -> Result<Fingerprint> {
         let path = path.as_ref();
 
         // Use the parent path to get libname and hash, replacing - with _
@@ -763,7 +794,11 @@ impl Fingerprint {
     }
 
     pub fn name(&self) -> String {
-        self.libname.split('-').next().unwrap_or(&self.libname).to_string()
+        self.libname
+            .split('-')
+            .next()
+            .unwrap_or(&self.libname)
+            .to_string()
     }
 
     pub fn version(&self) -> Option<String> {
