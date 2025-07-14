@@ -316,9 +316,16 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
     // Process fingerprints in parallel
     let fingerprints: Vec<_> = fingerprint_paths
         .par_iter()
-        .filter_map(|path| Fingerprint::from_path(path, metadata.as_ref()).ok())
+        .filter_map(|path| {
+            match Fingerprint::from_path(path, metadata.as_ref()) {
+                Ok(fp) => Some(fp),
+                Err(_) => None
+            }
+        })
         .collect();
 
+
+    
     for finger in fingerprints {
         let locked_ver = match locked_deps.get(&finger.name()) {
             Some(ver) => ver,
@@ -332,6 +339,8 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
         } else {
             None
         };
+        
+
 
         // Improved version matching logic with semantic versioning
         match (found_deps.entry(finger.name()), finger.version()) {
@@ -443,6 +452,8 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
         }
     }
 
+
+    
     let result: Vec<Fingerprint> = found_deps
         .into_iter()
         .filter_map(|(name, val)| {
@@ -669,51 +680,40 @@ fn extract_version_from_fingerprint<P: AsRef<Path>>(path: P, metadata: Option<&c
                         return Ok(Some(matching_packages[0].version.to_string()));
                     }
                     n if n > 1 => {
-                        // Multiple versions - need to determine which one this fingerprint belongs to
-                        
-                        // Try to read the fingerprint file to get more info
-                        if let Ok(content) = fs::read_to_string(path) {
-                            // Look for dependency information that might help us distinguish versions
-                            for pkg in &matching_packages {
-                                // Check if this fingerprint references dependencies that are specific to this version
-                                if pkg.version.to_string().starts_with("0.8") && content.contains("rand_chacha") {
-                                    // rand 0.8.x uses rand_chacha
-                                    return Ok(Some(pkg.version.to_string()));
-                                } else if pkg.version.to_string().starts_with("0.5") && content.contains("rand_core") && content.contains("0.3") {
-                                    // rand 0.5.x uses rand_core 0.3
-                                    return Ok(Some(pkg.version.to_string()));
-                                }
+                        // Multiple versions - use the directory hash to deterministically select one
+                        // This ensures consistent selection for the same build
+                        let hash = dir_name.split('-').next_back().unwrap_or("");
+                        if hash.len() >= 8 {
+                            if let Ok(hash_val) = u64::from_str_radix(&hash[..8], 16) {
+                                let mut sorted_packages = matching_packages;
+                                sorted_packages.sort_by(|a, b| a.version.cmp(&b.version));
+                                let idx = (hash_val % sorted_packages.len() as u64) as usize;
+                                return Ok(Some(sorted_packages[idx].version.to_string()));
                             }
                         }
                         
-                        // If we can't determine from dependencies, sort by version and use the hash as a tiebreaker
+                        // If hash parsing fails, use the first (lowest) version
                         let mut sorted_packages = matching_packages;
                         sorted_packages.sort_by(|a, b| a.version.cmp(&b.version));
-                        
-                        // Use the hash to determine which version this is
-                        let hash = dir_name.split('-').next_back().unwrap_or("");
-                        if hash.len() >= 8 {
-                            let hash_val = u64::from_str_radix(&hash[..8], 16).unwrap_or(0);
-                            let idx = (hash_val % sorted_packages.len() as u64) as usize;
-                            return Ok(Some(sorted_packages[idx].version.to_string()));
-                        }
+                        return Ok(Some(sorted_packages[0].version.to_string()));
                     }
                     _ => {
-                        // No matching packages or zero packages - continue to fallback logic
+                        // No matching packages - continue to fallback logic
                     }
                 }
             }
         }
     }
     
-    // Fallback to the original logic
-    let content = fs::read_to_string(path)?;
-    for line in content.lines() {
-        if line.contains("version:") {
-            if let Some(version) = line.split("version:").nth(1) {
-                let version = version.trim();
-                if !version.is_empty() {
-                    return Ok(Some(version.to_string()));
+    // Fallback to the original logic - try to find version in the fingerprint file
+    if let Ok(content) = fs::read_to_string(path) {
+        for line in content.lines() {
+            if line.contains("version:") {
+                if let Some(version) = line.split("version:").nth(1) {
+                    let version = version.trim();
+                    if !version.is_empty() {
+                        return Ok(Some(version.to_string()));
+                    }
                 }
             }
         }
