@@ -61,9 +61,7 @@ impl PersistentCache {
                     Ok(Self::new())
                 }
             }
-            Err(_) => {
-                Ok(Self::new())
-            }
+            Err(_) => Ok(Self::new()),
         }
     }
 
@@ -296,7 +294,8 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
     let metadata_path = root_dir.join("Cargo.toml");
     let metadata = get_cargo_meta(&metadata_path).ok();
 
-    let mut found_deps: std::collections::BTreeMap<String, Fingerprint> = std::collections::BTreeMap::new();
+    let mut found_deps: std::collections::BTreeMap<String, Fingerprint> =
+        std::collections::BTreeMap::new();
 
     // Collect all fingerprint paths first and sort for deterministic behavior
     let mut fingerprint_paths: Vec<_> = WalkDir::new(fingerprint_dir)
@@ -304,7 +303,7 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path().to_owned())
         .collect();
-    
+
     fingerprint_paths.sort();
 
     let fingerprints: Vec<_> = fingerprint_paths
@@ -394,35 +393,29 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
                     if *req_ver == ver {
                         e.insert(finger);
                     }
-                } else {
-                    if *locked_ver == ver {
+                } else if *locked_ver == ver {
+                    e.insert(finger);
+                } else if let (Ok(req), Ok(version)) =
+                    (VersionReq::parse(locked_ver), Version::parse(&ver))
+                {
+                    if req.matches(&version) {
                         e.insert(finger);
+                    }
+                } else {
+                    let req_str = if locked_ver.matches('.').count() == 1 {
+                        format!("^{}.0", locked_ver)
                     } else {
-                        if let (Ok(req), Ok(version)) =
-                            (VersionReq::parse(locked_ver), Version::parse(&ver))
-                        {
-                            if req.matches(&version) {
-                                e.insert(finger);
-                            }
-                        } else {
-                            let req_str = if locked_ver.matches('.').count() == 1 {
-                                format!("^{}.0", locked_ver)
-                            } else {
-                                format!("^{}", locked_ver)
-                            };
+                        format!("^{}", locked_ver)
+                    };
 
-                            if let (Ok(req), Ok(version)) =
-                                (VersionReq::parse(&req_str), Version::parse(&ver))
-                            {
-                                if req.matches(&version) {
-                                    e.insert(finger);
-                                }
-                            } else {
-                                if *locked_ver == ver {
-                                    e.insert(finger);
-                                }
-                            }
+                    if let (Ok(req), Ok(version)) =
+                        (VersionReq::parse(&req_str), Version::parse(&ver))
+                    {
+                        if req.matches(&version) {
+                            e.insert(finger);
                         }
+                    } else if *locked_ver == ver {
+                        e.insert(finger);
                     }
                 }
             }
@@ -455,8 +448,7 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
 
     // Save to persistent cache
     persistent_cache.insert(cache_key_str, result.clone(), cache_key_hash);
-    if persistent_cache.save_to_file(&root_dir).is_err() {
-    }
+    let _ = persistent_cache.save_to_file(&root_dir);
 
     Ok(result)
 }
@@ -472,7 +464,10 @@ pub fn populate_cache_during_build(root_dir: &Path, target_triple: &str) -> Resu
         let cache_key_hash = PersistentCache::generate_cache_key_hash(root_dir, target_dir);
 
         let persistent_cache = PersistentCache::load_from_file(root_dir)?;
-        if persistent_cache.get(&cache_key_str, cache_key_hash).is_some() {
+        if persistent_cache
+            .get(&cache_key_str, cache_key_hash)
+            .is_some()
+        {
             return Ok(true);
         }
 
@@ -632,8 +627,6 @@ fn extract_version_from_fingerprint<P: AsRef<Path>>(
     metadata: Option<&cargo_metadata::Metadata>,
 ) -> Result<Option<String>> {
     let path = path.as_ref();
-    
-
 
     // First, try to extract version from the directory name using cached metadata
     if let Some(metadata) = metadata {
@@ -655,33 +648,43 @@ fn extract_version_from_fingerprint<P: AsRef<Path>>(
                     }
                     n if n > 1 => {
                         // Multiple versions - need to read fingerprint JSON to determine which one
-                        let json_path = parent.join(format!("lib-{}.json", lib_name.replace('_', "-")));
+                        let json_path =
+                            parent.join(format!("lib-{}.json", lib_name.replace('_', "-")));
                         if json_path.exists() {
                             if let Ok(json_content) = std::fs::read_to_string(&json_path) {
-                                if let Ok(fingerprint_data) = serde_json::from_str::<serde_json::Value>(&json_content) {
-                                    if let Some(features) = fingerprint_data.get("features")
+                                if let Ok(fingerprint_data) =
+                                    serde_json::from_str::<serde_json::Value>(&json_content)
+                                {
+                                    if let Some(features) = fingerprint_data
+                                        .get("features")
                                         .and_then(|f| f.as_str())
-                                        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok()) {
-                                        
+                                        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                                    {
                                         // Try to match features against package versions
                                         for pkg in &matching_packages {
                                             // Check if this package's features match the fingerprint
                                             if lib_name == "rand" {
                                                 // For rand, use thread_rng as a distinguishing feature
-                                                let has_thread_rng = features.contains(&"thread_rng".to_string());
-                                                let pkg_has_thread_rng = pkg.features.contains_key("thread_rng");
-                                                
+                                                let has_thread_rng =
+                                                    features.contains(&"thread_rng".to_string());
+                                                let pkg_has_thread_rng =
+                                                    pkg.features.contains_key("thread_rng");
+
                                                 if has_thread_rng == pkg_has_thread_rng {
                                                     return Ok(Some(pkg.version.to_string()));
                                                 }
                                             } else {
                                                 // For other packages, use a more general approach
                                                 // This is a simplified check - in practice, you might need more sophisticated matching
-                                                let feature_set: std::collections::HashSet<_> = features.iter().collect();
-                                                let pkg_feature_set: std::collections::HashSet<_> = pkg.features.keys().collect();
-                                                
+                                                let feature_set: std::collections::HashSet<_> =
+                                                    features.iter().collect();
+                                                let pkg_feature_set: std::collections::HashSet<_> =
+                                                    pkg.features.keys().collect();
+
                                                 // Check if there's significant overlap
-                                                let intersection_count = feature_set.intersection(&pkg_feature_set).count();
+                                                let intersection_count = feature_set
+                                                    .intersection(&pkg_feature_set)
+                                                    .count();
                                                 if intersection_count > 0 {
                                                     return Ok(Some(pkg.version.to_string()));
                                                 }
@@ -691,7 +694,7 @@ fn extract_version_from_fingerprint<P: AsRef<Path>>(
                                 }
                             }
                         }
-                        
+
                         // If we can't determine from features, fall back to highest version
                         let mut sorted_packages = matching_packages;
                         sorted_packages.sort_by(|a, b| b.version.cmp(&a.version)); // Sort descending

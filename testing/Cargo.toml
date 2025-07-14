@@ -1,6 +1,7 @@
 [package]
 name = "testing"
 version = "0.1.0"
+edition = "2021"
 build = "build.rs"
 publish = false
 
@@ -19,7 +20,7 @@ path = "../skeptic"
 
 [dependencies.derive_more]
 version = "0.99"
-default_features = false
+default-features = false
 features = ["from"]
 
 # Dependencies for testing multiple rand versions scenario
