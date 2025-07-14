@@ -28,3 +28,4 @@ lazy_static = "1.4"
 
 [dev-dependencies]
 unindent = "0.2"
+tempfile = "3"
