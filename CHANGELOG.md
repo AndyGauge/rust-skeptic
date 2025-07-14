@@ -1,12 +1,8 @@
 # 0.14.0
 
-* [Fixed dependency resolution conflicts between direct and transitive dependencies](https://github.com/budziq/rust-skeptic/issues/xxx)
-* [Added persistent caching system to dramatically improve test performance](https://github.com/budziq/rust-skeptic/issues/xxx)
-* [Implemented build-time cache population for faster test execution](https://github.com/budziq/rust-skeptic/issues/xxx)
-* [Enhanced version detection logic to handle multiple versions of the same crate](https://github.com/budziq/rust-skeptic/issues/xxx)
-* [Added parallel processing of fingerprint files for improved performance](https://github.com/budziq/rust-skeptic/issues/xxx)
+* [Skeptic fails to find dependencies starting with Rust 1.77](https://github.com/budziq/rust-skeptic/issues/141)
 
-Contributors: Andy
+Contributors: Andrew Gauger
 
 # 0.13.5
 
