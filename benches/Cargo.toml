@@ -1,0 +1,20 @@
+[package]
+name = "skeptic-benches"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone workspace: keeps divan/CodSpeed (which need a recent rustc)
+# out of the MSRV-checked main workspace.
+[workspace]
+
+[dependencies]
+skeptic = { path = "../skeptic" }
+
+[[bench]]
+name = "generate"
+harness = false
+
+[dev-dependencies]
+divan = { version = "5.0.2", package = "codspeed-divan-compat" }
+tempfile = "3"
