@@ -90,7 +90,6 @@ where
 
     let docs = docs
         .iter()
-        .cloned()
         .map(|path| path.as_ref().to_str().unwrap().to_owned())
         .filter(|d| !d.ends_with(".skt.md"))
         .collect::<Vec<_>>();

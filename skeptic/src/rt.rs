@@ -1,7 +1,6 @@
 use std::collections::btree_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -164,6 +163,8 @@ struct Prepared {
     edition: Option<&'static str>,
     target_dir: PathBuf,
     deps_dir: PathBuf,
+    /// Directories holding the dependency rlibs (many, in the newer layout).
+    search_dirs: Vec<PathBuf>,
     externs: Vec<(String, PathBuf)>,
 }
 
@@ -180,6 +181,43 @@ pub fn clear_caches(root_dir: &str) {
     let _ = fs::remove_file(PersistentCache::get_cache_file_path(Path::new(root_dir)));
 }
 
+/// The `target/<profile>` directory, found from a build script's `OUT_DIR`.
+/// Cargo has laid that out as both `build/<pkg>-<hash>/out` and
+/// `build/<pkg>/<hash>/out`, so look for the outermost `build` directory
+/// within reach instead of assuming a depth.
+fn profile_dir(out_dir: &Path) -> PathBuf {
+    out_dir
+        .ancestors()
+        .skip(1)
+        .take(4)
+        .filter(|dir| dir.file_name().map_or(false, |name| name == "build"))
+        .last()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| {
+            // Unusual layout: fall back to the classic depth.
+            let mut dir = out_dir.to_path_buf();
+            dir.pop();
+            dir.pop();
+            dir.pop();
+            dir
+        })
+}
+
+/// Where cargo keeps per-unit fingerprints: `.fingerprint/` in the classic
+/// layout, or inside `build/<pkg>/<hash>/fingerprint/` in the newer one.
+fn fingerprint_root(target_dir: &Path) -> Option<PathBuf> {
+    let classic = target_dir.join(".fingerprint");
+    if classic.is_dir() {
+        return Some(classic);
+    }
+    let build = target_dir.join("build");
+    if build.is_dir() {
+        return Some(build);
+    }
+    None
+}
+
 fn prepare(root_dir: &str, target_dir: &str) -> Arc<Prepared> {
     // Held while computing so concurrent tests wait for one resolution
     // instead of each doing their own.
@@ -190,10 +228,7 @@ fn prepare(root_dir: &str, target_dir: &str) -> Arc<Prepared> {
     }
 
     let root_dir = PathBuf::from(root_dir);
-    let mut target_dir = PathBuf::from(target_dir);
-    target_dir.pop();
-    target_dir.pop();
-    target_dir.pop();
+    let target_dir = profile_dir(Path::new(target_dir));
     let deps_dir = target_dir.join("deps");
 
     let metadata_path = root_dir.join("Cargo.toml");
@@ -210,16 +245,38 @@ fn prepare(root_dir: &str, target_dir: &str) -> Arc<Prepared> {
         None
     };
 
-    let externs = get_rlib_dependencies(root_dir, target_dir.clone())
+    let externs: Vec<(String, PathBuf)> = get_rlib_dependencies(root_dir, target_dir.clone())
         .expect("failed to read dependencies")
         .into_iter()
         .map(|dep| (dep.libname, dep.rlib))
         .collect();
 
+    // In the newer layout every unit's rlibs live in their own directory, and
+    // rustc must be able to see all of them: a dependency may have been built
+    // in several variants, and the one a crate was compiled against is not
+    // necessarily the one we pass with --extern.
+    let mut search_dirs: Vec<PathBuf> = Vec::new();
+    if !target_dir.join(".fingerprint").is_dir() {
+        for pkg in fs::read_dir(target_dir.join("build"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            for unit in fs::read_dir(pkg.path()).into_iter().flatten().flatten() {
+                let out = unit.path().join("out");
+                if unit.path().join("fingerprint").is_dir() && out.is_dir() {
+                    search_dirs.push(out);
+                }
+            }
+        }
+        search_dirs.sort();
+    }
+
     let prepared = Arc::new(Prepared {
         edition,
         target_dir,
         deps_dir,
+        search_dirs,
         externs,
     });
     cache.insert(key, Arc::clone(&prepared));
@@ -338,6 +395,12 @@ fn execute(
         .arg("--target")
         .arg(target_triple);
 
+    for dir in &prepared.search_dirs {
+        let mut arg = std::ffi::OsString::from("dependency=");
+        arg.push(dir);
+        cmd.arg("-L").arg(arg);
+    }
+
     for (libname, rlib) in &prepared.externs {
         cmd.arg("--extern");
         cmd.arg(format!(
@@ -422,7 +485,8 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
         }
     }
 
-    let fingerprint_dir = target_dir.join(".fingerprint/");
+    let fingerprint_dir =
+        fingerprint_root(&target_dir).unwrap_or_else(|| target_dir.join(".fingerprint"));
 
     // Get cargo metadata once and reuse it for all fingerprints
     let metadata_path = root_dir.join("Cargo.toml");
@@ -432,7 +496,10 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
         std::collections::BTreeMap::new();
 
     // Collect all fingerprint paths first and sort for deterministic behavior
+    // (`build/<pkg>/<hash>/fingerprint/<file>` is four levels down in the
+    // newer layout; the classic one is two.)
     let mut fingerprint_paths: Vec<_> = WalkDir::new(fingerprint_dir)
+        .max_depth(4)
         .into_iter()
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path().to_owned())
@@ -590,7 +657,7 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
 /// Populate the cache during the build phase to make test runs faster
 pub fn populate_cache_during_build(root_dir: &Path, target_triple: &str) -> Result<()> {
     fn populate_cache_for_target(root_dir: &Path, target_dir: &Path) -> Result<bool> {
-        if !target_dir.exists() || !target_dir.join(".fingerprint").exists() {
+        if !target_dir.exists() || fingerprint_root(target_dir).is_none() {
             return Ok(false);
         }
 
@@ -756,6 +823,28 @@ fn guess_ext(mut path: PathBuf, exts: &[&str]) -> Result<PathBuf> {
     Err(SkepticError::Fingerprint)
 }
 
+/// The crate name and unit hash a fingerprint file belongs to.
+///
+/// Classic layout: `.fingerprint/<lib>-<hash>/lib-<lib>.json`.
+/// Newer layout: `build/<pkg>/<hash>/fingerprint/lib-<lib>.json`.
+fn fingerprint_identity(path: &Path) -> Option<(String, String)> {
+    let unit_dir = path.parent()?;
+    let dir_name = unit_dir.file_name()?.to_str()?;
+
+    if dir_name == "fingerprint" {
+        let hash = unit_dir.parent()?.file_name()?.to_str()?;
+        let stem = path.file_stem()?.to_str()?;
+        let lib = stem.strip_prefix("lib-")?;
+        return Some((lib.replace('-', "_"), hash.to_owned()));
+    }
+
+    let mut captures = dir_name.rsplit('-');
+    let hash = captures.next()?;
+    let mut name_parts = captures.collect::<Vec<_>>();
+    name_parts.reverse();
+    Some((name_parts.join("_"), hash.to_owned()))
+}
+
 fn extract_version_from_fingerprint<P: AsRef<Path>>(
     path: P,
     metadata: Option<&cargo_metadata::Metadata>,
@@ -765,9 +854,7 @@ fn extract_version_from_fingerprint<P: AsRef<Path>>(
     // First, try to extract version from the directory name using cached metadata
     if let Some(metadata) = metadata {
         if let Some(parent) = path.parent() {
-            if let Some(dir_name) = parent.file_name().and_then(|n| n.to_str()) {
-                let lib_name = dir_name.split('-').next().unwrap_or("").replace('-', "_");
-
+            if let Some((lib_name, _)) = fingerprint_identity(path) {
                 // Find all packages with this name
                 let matching_packages: Vec<_> = metadata
                     .packages
@@ -866,30 +953,35 @@ impl Fingerprint {
     ) -> Result<Fingerprint> {
         let path = path.as_ref();
 
-        // Use the parent path to get libname and hash, replacing - with _
-        let mut captures = path
-            .parent()
-            .and_then(Path::file_stem)
-            .and_then(OsStr::to_str)
-            .ok_or(SkepticError::Fingerprint)?
-            .rsplit('-');
-        let hash = captures.next().ok_or(SkepticError::Fingerprint)?;
-        let mut libname_parts = captures.collect::<Vec<_>>();
-        libname_parts.reverse();
-        let libname = libname_parts.join("_");
+        let (libname, hash) = fingerprint_identity(path).ok_or(SkepticError::Fingerprint)?;
 
         path.extension()
-            .and_then(|e| if e == "json" { Some(e) } else { None })
+            .filter(|&e| e == "json")
             .ok_or(SkepticError::Fingerprint)?;
 
-        let mut rlib = PathBuf::from(path);
-        rlib.pop();
-        rlib.pop();
-        rlib.pop();
-        let mut dll = rlib.clone();
-        rlib.push(format!("deps/lib{}-{}", libname, hash));
-        dll.push(format!("deps/{}-{}", libname, hash));
-        rlib = guess_ext(rlib, &["rlib", "so", "dylib"]).or_else(|_| guess_ext(dll, &["dll"]))?;
+        // Classic layout: <profile>/.fingerprint/<lib>-<hash>/<file>.json with
+        // the rlib in <profile>/deps. Newer layout:
+        // <profile>/build/<pkg>/<hash>/fingerprint/<file>.json with the rlib in
+        // the sibling `out` directory.
+        let unit_dir = path.parent().ok_or(SkepticError::Fingerprint)?;
+        let (rlib, dll) = if unit_dir.file_name().map_or(false, |n| n == "fingerprint") {
+            let out = unit_dir.with_file_name("out");
+            (
+                out.join(format!("lib{}-{}", libname, hash)),
+                out.join(format!("{}-{}", libname, hash)),
+            )
+        } else {
+            let profile = unit_dir
+                .parent()
+                .and_then(Path::parent)
+                .ok_or(SkepticError::Fingerprint)?;
+            (
+                profile.join(format!("deps/lib{}-{}", libname, hash)),
+                profile.join(format!("deps/{}-{}", libname, hash)),
+            )
+        };
+        let rlib =
+            guess_ext(rlib, &["rlib", "so", "dylib"]).or_else(|_| guess_ext(dll, &["dll"]))?;
 
         // Try to extract version from the fingerprint file content
         let version = extract_version_from_fingerprint(path, metadata)?;
@@ -944,4 +1036,61 @@ fn edition_str(edition: &Edition) -> Option<&'static str> {
         Edition::E2021 => "2021",
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn profile_dir_classic_layout() {
+        let out = Path::new("/w/target/debug/build/testing-0123abcd/out");
+        assert_eq!(profile_dir(out), Path::new("/w/target/debug"));
+    }
+
+    #[test]
+    fn profile_dir_new_layout() {
+        let out = Path::new("/w/target/debug/build/testing/0123abcd/out");
+        assert_eq!(profile_dir(out), Path::new("/w/target/debug"));
+    }
+
+    #[test]
+    fn profile_dir_package_named_build() {
+        let out = Path::new("/w/target/debug/build/build/0123abcd/out");
+        assert_eq!(profile_dir(out), Path::new("/w/target/debug"));
+    }
+
+    #[test]
+    fn profile_dir_ignores_build_dirs_above_target() {
+        let out = Path::new("/home/me/build/proj/target/release/build/x-1/out");
+        assert_eq!(
+            profile_dir(out),
+            Path::new("/home/me/build/proj/target/release")
+        );
+    }
+
+    #[test]
+    fn fingerprint_identity_classic() {
+        let path = Path::new("/w/target/debug/.fingerprint/rand_core-0123abcd/lib-rand_core.json");
+        assert_eq!(
+            fingerprint_identity(path),
+            Some(("rand_core".to_owned(), "0123abcd".to_owned()))
+        );
+    }
+
+    #[test]
+    fn fingerprint_identity_new_layout() {
+        let path =
+            Path::new("/w/target/debug/build/rand_core/0123abcd/fingerprint/lib-rand_core.json");
+        assert_eq!(
+            fingerprint_identity(path),
+            Some(("rand_core".to_owned(), "0123abcd".to_owned()))
+        );
+    }
+
+    #[test]
+    fn fingerprint_identity_new_layout_rejects_non_lib_units() {
+        let path = Path::new("/w/target/debug/build/foo/0123abcd/fingerprint/run-build-script-build-script-build.json");
+        assert_eq!(fingerprint_identity(path), None);
+    }
 }
