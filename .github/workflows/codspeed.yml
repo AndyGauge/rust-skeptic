@@ -12,20 +12,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # Real-world corpus; cargo test builds the deps skeptic's rt looks up.
-      - run: |
-          git clone --depth 1 -b skeptic-test https://github.com/djc/rust-cookbook ../rust-cookbook
-          (cd ../rust-cookbook && cargo test --no-run)
+      # Real-world corpus for the generate benchmarks (markdown only).
+      - run: git clone --depth 1 -b skeptic-test https://github.com/djc/rust-cookbook ../rust-cookbook
       - run: cargo install cargo-codspeed --locked
-      - run: cargo codspeed build
+      # Only the in-process `generate` target: simulation mode counts this
+      # process's instructions and cannot see child rustc processes. The
+      # `rt` target runs locally with `cargo bench --bench rt`.
+      - run: cargo codspeed build --bench generate
         working-directory: benches
       - uses: CodSpeedHQ/action@v3
         env:
           COOKBOOK_DIR: ${{ github.workspace }}/../rust-cookbook
         with:
           working-directory: benches
-          # Simulation mode counts this process's instructions and cannot see
-          # child rustc processes, so only run the in-process benchmarks.
-          # (The rt::* ones run locally with `cargo bench`.)
           run: cargo codspeed run generate
           token: ${{ secrets.CODSPEED_TOKEN }}
