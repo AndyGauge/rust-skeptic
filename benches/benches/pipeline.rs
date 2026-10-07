@@ -16,8 +16,11 @@ fn main() {
     divan::main();
 }
 
+/// The cookbook checkout, canonicalized: cargo reports manifest paths in
+/// canonical form and skeptic compares them as strings.
 fn cookbook() -> Option<PathBuf> {
-    std::env::var_os("COOKBOOK_DIR").map(PathBuf::from)
+    let dir = std::env::var_os("COOKBOOK_DIR")?;
+    Some(std::fs::canonicalize(&dir).unwrap_or_else(|e| panic!("COOKBOOK_DIR {:?}: {}", dir, e)))
 }
 
 fn triple() -> &'static str {
@@ -33,8 +36,14 @@ const HOST: &str = "x86_64-unknown-linux-gnu";
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const HOST: &str = "aarch64-unknown-linux-gnu";
 #[cfg(not(any(
-    all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")),
-    all(target_os = "linux", any(target_arch = "aarch64", target_arch = "x86_64"))
+    all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ),
+    all(
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )
 )))]
 const HOST: &str = "";
 
@@ -42,7 +51,11 @@ const HOST: &str = "";
 fn markdown(blocks: usize) -> String {
     let mut s = String::from("# Page\n\nIntro text.\n\n");
     for i in 0..blocks {
-        writeln!(s, "## Section {i}\n\nSome *prose* with `code` and a [link](x).\n").unwrap();
+        writeln!(
+            s,
+            "## Section {i}\n\nSome *prose* with `code` and a [link](x).\n"
+        )
+        .unwrap();
         writeln!(
             s,
             "```rust\n# use std::collections::HashMap;\nfn main() {{\n    let mut m = HashMap::new();\n    m.insert({i}, {i});\n    assert_eq!(m[&{i}], {i});\n}}\n```\n"
@@ -117,7 +130,11 @@ mod fixtures {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/fixtures");
         let dir = root.join(name);
         // The workspace fixture is benchmarked through its `root` member.
-        let entry = if name == "workspace" { dir.join("root") } else { dir.clone() };
+        let entry = if name == "workspace" {
+            dir.join("root")
+        } else {
+            dir.clone()
+        };
         if entry.join("target").exists() {
             return entry;
         }
@@ -154,7 +171,9 @@ mod fixtures {
                     );
                     lib(&dir.join(format!("m{i}")));
                 }
-                let deps: String = (0..8).map(|i| format!("m{i} = {{ path = \"../m{i}\" }}\n")).collect();
+                let deps: String = (0..8)
+                    .map(|i| format!("m{i} = {{ path = \"../m{i}\" }}\n"))
+                    .collect();
                 write(
                     &dir.join("root/Cargo.toml"),
                     &format!("[package]\nname = \"root\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{deps}"),
@@ -169,7 +188,10 @@ mod fixtures {
             "conflicting" => {
                 // Direct rand 0.9 plus a path crate that pins rand 0.8, so two
                 // versions of the same crate (and of its rlibs) coexist.
-                write(&dir.join("Cargo.toml"), &pkg("rand = \"0.9\"\nold = { path = \"old\" }\n"));
+                write(
+                    &dir.join("Cargo.toml"),
+                    &pkg("rand = \"0.9\"\nold = { path = \"old\" }\n"),
+                );
                 lib(&dir);
                 write(
                     &dir.join("old/Cargo.toml"),

@@ -24,5 +24,8 @@ jobs:
           COOKBOOK_DIR: ${{ github.workspace }}/../rust-cookbook
         with:
           working-directory: benches
-          run: cargo codspeed run
+          # Simulation mode counts this process's instructions and cannot see
+          # child rustc processes, so only run the in-process benchmarks.
+          # (The rt::* ones run locally with `cargo bench`.)
+          run: cargo codspeed run generate
           token: ${{ secrets.CODSPEED_TOKEN }}
