@@ -172,6 +172,14 @@ type PreparedKey = (String, String);
 static PREPARED: Lazy<Mutex<HashMap<PreparedKey, Arc<Prepared>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// Forget everything cached in memory and on disk for `root_dir`, so the next
+/// snippet pays the full setup cost. Intended for benchmarks.
+#[doc(hidden)]
+pub fn clear_caches(root_dir: &str) {
+    PREPARED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    let _ = fs::remove_file(PersistentCache::get_cache_file_path(Path::new(root_dir)));
+}
+
 fn prepare(root_dir: &str, target_dir: &str) -> Arc<Prepared> {
     // Held while computing so concurrent tests wait for one resolution
     // instead of each doing their own.
