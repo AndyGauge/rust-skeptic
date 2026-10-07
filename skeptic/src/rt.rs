@@ -5,10 +5,14 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::SystemTime;
 
 use cargo_metadata::Edition;
 
+use once_cell::sync::Lazy;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -153,45 +157,37 @@ pub fn run_test(root_dir: &str, out_dir: &str, target_triple: &str, test_text: &
     );
 }
 
-fn handle_test(
-    root_dir: &str,
-    target_dir: &str,
-    target_triple: &str,
-    test_text: &str,
-    compile_type: CompileType,
-) {
-    let out_dir = tempfile::Builder::new()
-        .prefix("rust-skeptic")
-        .tempdir()
-        .unwrap();
-    let testcase_path = out_dir.path().join("test.rs");
-    fs::write(&testcase_path, test_text.as_bytes()).unwrap();
+/// Everything needed to invoke `rustc` that is the same for every snippet of
+/// a given project. Resolving it runs `cargo metadata` and walks the
+/// fingerprint directory, so it is computed once and shared.
+struct Prepared {
+    edition: Option<&'static str>,
+    target_dir: PathBuf,
+    deps_dir: PathBuf,
+    externs: Vec<(String, PathBuf)>,
+}
 
-    // OK, here's where a bunch of magic happens using assumptions
-    // about cargo internals. We are going to use rustc to compile
-    // the examples, but to do that we've got to tell it where to
-    // look for the rlibs with the -L flag, and what their names
-    // are with the --extern flag. This is going to involve
-    // parsing fingerprints out of the lockfile and looking them
-    // up in the fingerprint file.
+type PreparedKey = (String, String);
+
+static PREPARED: Lazy<Mutex<HashMap<PreparedKey, Arc<Prepared>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn prepare(root_dir: &str, target_dir: &str) -> Arc<Prepared> {
+    // Held while computing so concurrent tests wait for one resolution
+    // instead of each doing their own.
+    let mut cache = PREPARED.lock().unwrap_or_else(|e| e.into_inner());
+    let key = (root_dir.to_owned(), target_dir.to_owned());
+    if let Some(prepared) = cache.get(&key) {
+        return Arc::clone(prepared);
+    }
 
     let root_dir = PathBuf::from(root_dir);
     let mut target_dir = PathBuf::from(target_dir);
     target_dir.pop();
     target_dir.pop();
     target_dir.pop();
-    let mut deps_dir = target_dir.clone();
-    deps_dir.push("deps");
+    let deps_dir = target_dir.join("deps");
 
-    let rustc = env::var("RUSTC").unwrap_or_else(|_| String::from("rustc"));
-    let mut cmd = Command::new(rustc);
-    cmd.arg(testcase_path)
-        .arg("--verbose")
-        .arg("--crate-type=bin");
-
-    // Find the edition
-
-    // This has to come before "-L".
     let metadata_path = root_dir.join("Cargo.toml");
     let metadata = get_cargo_meta(&metadata_path).expect("failed to read Cargo.toml");
     let edition = metadata
@@ -200,23 +196,146 @@ fn handle_test(
         .filter_map(|package| edition_str(&package.edition))
         .max()
         .unwrap();
-    if edition != "2015" {
+    let edition = if edition != "2015" {
+        Some(edition)
+    } else {
+        None
+    };
+
+    let externs = get_rlib_dependencies(root_dir, target_dir.clone())
+        .expect("failed to read dependencies")
+        .into_iter()
+        .map(|dep| (dep.libname, dep.rlib))
+        .collect();
+
+    let prepared = Arc::new(Prepared {
+        edition,
+        target_dir,
+        deps_dir,
+        externs,
+    });
+    cache.insert(key, Arc::clone(&prepared));
+    prepared
+}
+
+/// Captured result of running one command.
+struct Captured {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    failure: Option<String>,
+}
+
+/// Everything a worker produced for one snippet.
+struct Outcome {
+    steps: Vec<Captured>,
+}
+
+struct Job {
+    work: Box<dyn FnOnce() -> Outcome + Send>,
+    reply: Sender<Outcome>,
+}
+
+/// Number of snippets compiled/run at once: `SKEPTIC_JOBS`, else the CPU count.
+fn worker_count() -> usize {
+    env::var("SKEPTIC_JOBS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(num_cpus::get)
+}
+
+/// A fixed pool of workers fed by a queue. libtest runs each generated test
+/// on its own thread; those threads only enqueue and wait, so the number of
+/// concurrent `rustc` processes stays bounded.
+static QUEUE: Lazy<Mutex<Sender<Job>>> = Lazy::new(|| {
+    let (tx, rx) = mpsc::channel::<Job>();
+    let rx = Arc::new(Mutex::new(rx));
+    for _ in 0..worker_count() {
+        let rx = Arc::clone(&rx);
+        thread::spawn(move || loop {
+            let job = match rx.lock().unwrap_or_else(|e| e.into_inner()).recv() {
+                Ok(job) => job,
+                Err(_) => return,
+            };
+            let _ = job.reply.send((job.work)());
+        });
+    }
+    Mutex::new(tx)
+});
+
+fn handle_test(
+    root_dir: &str,
+    target_dir: &str,
+    target_triple: &str,
+    test_text: &str,
+    compile_type: CompileType,
+) {
+    let prepared = prepare(root_dir, target_dir);
+    let target_triple = target_triple.to_owned();
+    let test_text = test_text.to_owned();
+
+    let (reply, result) = mpsc::channel();
+    let job = Job {
+        work: Box::new(move || execute(&prepared, &target_triple, &test_text, compile_type)),
+        reply,
+    };
+    QUEUE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .send(job)
+        .expect("skeptic worker pool is gone");
+    let outcome = result.recv().expect("skeptic worker panicked");
+
+    // Report from the test's own thread so libtest attributes output and
+    // panics (including `should_panic`) to the right test.
+    for step in outcome.steps {
+        print!("{}", String::from_utf8(step.stdout).unwrap());
+        eprint!("{}", String::from_utf8(step.stderr).unwrap());
+        if let Some(failure) = step.failure {
+            panic!("{}", failure);
+        }
+    }
+}
+
+fn execute(
+    prepared: &Prepared,
+    target_triple: &str,
+    test_text: &str,
+    compile_type: CompileType,
+) -> Outcome {
+    let out_dir = tempfile::Builder::new()
+        .prefix("rust-skeptic")
+        .tempdir()
+        .unwrap();
+    let testcase_path = out_dir.path().join("test.rs");
+    fs::write(&testcase_path, test_text.as_bytes()).unwrap();
+
+    // We use rustc directly, telling it where the rlibs are with -L and
+    // their names with --extern (resolved once in `prepare`).
+    let rustc = env::var("RUSTC").unwrap_or_else(|_| String::from("rustc"));
+    let mut cmd = Command::new(rustc);
+    cmd.arg(testcase_path)
+        .arg("--verbose")
+        .arg("--crate-type=bin");
+
+    // This has to come before "-L".
+    if let Some(edition) = prepared.edition {
         cmd.arg(format!("--edition={}", edition));
     }
 
     cmd.arg("-L")
-        .arg(&target_dir)
+        .arg(&prepared.target_dir)
         .arg("-L")
-        .arg(&deps_dir)
+        .arg(&prepared.deps_dir)
         .arg("--target")
         .arg(target_triple);
 
-    for dep in get_rlib_dependencies(root_dir, target_dir).expect("failed to read dependencies") {
+    for (libname, rlib) in &prepared.externs {
         cmd.arg("--extern");
         cmd.arg(format!(
             "{}={}",
-            dep.libname,
-            dep.rlib.to_str().expect("filename not utf8"),
+            libname,
+            rlib.to_str().expect("filename not utf8"),
         ));
     }
 
@@ -229,23 +348,30 @@ fn handle_test(
         )),
     };
 
-    interpret_output(cmd);
+    let mut steps = vec![capture(cmd)];
 
-    if let CompileType::Check = compile_type {
-        return;
+    if let CompileType::Full = compile_type {
+        if steps[0].failure.is_none() {
+            let mut cmd = Command::new(binary_path);
+            cmd.current_dir(out_dir.path());
+            steps.push(capture(cmd));
+        }
     }
 
-    let mut cmd = Command::new(binary_path);
-    cmd.current_dir(out_dir.path());
-    interpret_output(cmd);
+    Outcome { steps }
 }
 
-fn interpret_output(mut command: Command) {
+fn capture(mut command: Command) -> Captured {
     let output = command.output().unwrap();
-    print!("{}", String::from_utf8(output.stdout).unwrap());
-    eprint!("{}", String::from_utf8(output.stderr).unwrap());
-    if !output.status.success() {
-        panic!("Command failed:\n{:?}", command);
+    let failure = if output.status.success() {
+        None
+    } else {
+        Some(format!("Command failed:\n{:?}", command))
+    };
+    Captured {
+        stdout: output.stdout,
+        stderr: output.stderr,
+        failure,
     }
 }
 

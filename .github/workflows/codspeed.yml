@@ -1,0 +1,28 @@
+name: CodSpeed
+
+on:
+  push:
+    branches: ['master']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  Benchmarks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Real-world corpus; cargo test builds the deps skeptic's rt looks up.
+      - run: |
+          git clone --depth 1 -b skeptic-test https://github.com/djc/rust-cookbook ../rust-cookbook
+          (cd ../rust-cookbook && cargo test --no-run)
+      - run: cargo install cargo-codspeed --locked
+      - run: cargo codspeed build
+        working-directory: benches
+      - uses: CodSpeedHQ/action@v3
+        env:
+          COOKBOOK_DIR: ${{ github.workspace }}/../rust-cookbook
+        with:
+          working-directory: benches
+          run: cargo codspeed run
+          token: ${{ secrets.CODSPEED_TOKEN }}
