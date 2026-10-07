@@ -208,11 +208,14 @@ fn extract_tests_from_string(s: &str, file_stem: &str) -> (Vec<Test>, Option<Str
     let parser = Parser::new(s);
     let mut section = None;
     let mut code_block_start = 0;
+    // Line numbers are only needed where a code block starts, so count
+    // newlines incrementally from the previous such position (offset, line)
+    // instead of from the start of the file for every event.
+    let mut line_cursor = (0usize, 0usize);
     // Oh this isn't actually a test but a legacy template
     let mut old_template = None;
 
     for (event, range) in parser.into_offset_iter() {
-        let line_number = bytecount::count(&s.as_bytes()[0..range.start], b'\n');
         match event {
             Event::Start(Tag::Heading(level, ..)) if level < HeadingLevel::H3 => {
                 buffer = Buffer::Heading(String::new());
@@ -232,7 +235,13 @@ fn extract_tests_from_string(s: &str, file_stem: &str) -> (Vec<Test>, Option<Str
             Event::Text(text) => {
                 if let Buffer::Code(ref mut buf) = buffer {
                     if buf.is_empty() {
-                        code_block_start = line_number;
+                        let (pos, line) = line_cursor;
+                        code_block_start = if range.start >= pos {
+                            line + bytecount::count(&s.as_bytes()[pos..range.start], b'\n')
+                        } else {
+                            line - bytecount::count(&s.as_bytes()[range.start..pos], b'\n')
+                        };
+                        line_cursor = (range.start, code_block_start);
                     }
                     buf.extend(text.lines().map(|s| format!("{}\n", s)));
                 } else if let Buffer::Heading(ref mut buf) = buffer {
