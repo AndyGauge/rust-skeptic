@@ -1,6 +1,9 @@
 # 0.14.0
 
 * [Skeptic fails to find dependencies starting with Rust 1.77](https://github.com/budziq/rust-skeptic/issues/141)
+* Support cargo's newer build directory layout (`build/<pkg>/<hash>/{fingerprint,out}`)
+* Resolve rustc setup once per process and run snippets on a bounded worker pool (`SKEPTIC_JOBS`)
+* Bumped minimal Rust version to 1.85
 
 Contributors: Andrew Gauger
 
