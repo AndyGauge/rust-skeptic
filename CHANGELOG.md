@@ -4,6 +4,7 @@
 * Support cargo's newer build directory layout (`build/<pkg>/<hash>/{fingerprint,out}`)
 * Resolve rustc setup once per process and run snippets on a bounded worker pool (`SKEPTIC_JOBS`)
 * Bumped minimal Rust version to 1.85
+* Replaced the unmaintained `bincode` with `serde_json` for the `.skeptic-cache` file (caches from older releases are rebuilt)
 
 Contributors: Andrew Gauger
 

@@ -56,7 +56,9 @@ impl PersistentCache {
         }
 
         let data = fs::read(&cache_file)?;
-        match bincode::deserialize::<PersistentCache>(&data) {
+        // A cache written by an older release (binary) fails to parse and is
+        // simply rebuilt.
+        match serde_json::from_slice::<PersistentCache>(&data) {
             Ok(cache) => {
                 if cache.cache_version == 1 {
                     Ok(cache)
@@ -70,7 +72,7 @@ impl PersistentCache {
 
     pub fn save_to_file(&self, root_dir: &Path) -> Result<()> {
         let cache_file = Self::get_cache_file_path(root_dir);
-        let data = bincode::serialize(self).map_err(|e| {
+        let data = serde_json::to_vec(self).map_err(|e| {
             SkepticError::Io(std::io::Error::other(format!("Serialization error: {}", e)))
         })?;
         fs::write(&cache_file, data)?;
@@ -1089,5 +1091,46 @@ mod layout_tests {
     fn fingerprint_identity_new_layout_rejects_non_lib_units() {
         let path = Path::new("/w/target/debug/build/foo/0123abcd/fingerprint/run-build-script-build-script-build.json");
         assert_eq!(fingerprint_identity(path), None);
+    }
+}
+
+#[cfg(test)]
+mod cache_format_tests {
+    use super::*;
+
+    #[test]
+    fn unreadable_cache_file_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        // What an older, binary-format cache looks like to a JSON reader.
+        fs::write(
+            PersistentCache::get_cache_file_path(dir.path()),
+            [0u8, 1, 0, 0, 0, 0, 0, 0, 0, 255, 254],
+        )
+        .unwrap();
+        let cache = PersistentCache::load_from_file(dir.path()).unwrap();
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn cache_round_trips_through_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = PersistentCache::new();
+        let fingerprint = Fingerprint {
+            libname: "serde".to_owned(),
+            version: Some("1.0.0".to_owned()),
+            rlib: PathBuf::from("/t/deps/libserde-abc.rlib"),
+            mtime: SystemTime::now(),
+        };
+        cache.insert("k".to_owned(), vec![fingerprint], 42);
+        cache.save_to_file(dir.path()).unwrap();
+
+        let loaded = PersistentCache::load_from_file(dir.path()).unwrap();
+        let entry = &loaded.entries["k"];
+        assert_eq!(entry.cache_key_hash, 42);
+        assert_eq!(entry.fingerprints[0].libname, "serde");
+        assert_eq!(
+            entry.fingerprints[0].rlib,
+            Path::new("/t/deps/libserde-abc.rlib")
+        );
     }
 }
