@@ -71,10 +71,7 @@ impl PersistentCache {
     pub fn save_to_file(&self, root_dir: &Path) -> Result<()> {
         let cache_file = Self::get_cache_file_path(root_dir);
         let data = bincode::serialize(self).map_err(|e| {
-            SkepticError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Serialization error: {}", e),
-            ))
+            SkepticError::Io(std::io::Error::other(format!("Serialization error: {}", e)))
         })?;
         fs::write(&cache_file, data)?;
         Ok(())
@@ -190,7 +187,7 @@ fn profile_dir(out_dir: &Path) -> PathBuf {
         .ancestors()
         .skip(1)
         .take(4)
-        .filter(|dir| dir.file_name().map_or(false, |name| name == "build"))
+        .filter(|dir| dir.file_name().is_some_and(|name| name == "build"))
         .last()
         .and_then(Path::parent)
         .map(Path::to_path_buf)
@@ -964,7 +961,7 @@ impl Fingerprint {
         // <profile>/build/<pkg>/<hash>/fingerprint/<file>.json with the rlib in
         // the sibling `out` directory.
         let unit_dir = path.parent().ok_or(SkepticError::Fingerprint)?;
-        let (rlib, dll) = if unit_dir.file_name().map_or(false, |n| n == "fingerprint") {
+        let (rlib, dll) = if unit_dir.file_name().is_some_and(|n| n == "fingerprint") {
             let out = unit_dir.with_file_name("out");
             (
                 out.join(format!("lib{}-{}", libname, hash)),
