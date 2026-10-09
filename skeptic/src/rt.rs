@@ -531,9 +531,6 @@ fn get_rlib_dependencies(
     let fingerprint_dir =
         fingerprint_root(&target_dir).unwrap_or_else(|| target_dir.join(".fingerprint"));
 
-    let mut found_deps: std::collections::BTreeMap<String, Fingerprint> =
-        std::collections::BTreeMap::new();
-
     // Collect all fingerprint paths first and sort for deterministic behavior
     // (`build/<pkg>/<hash>/fingerprint/<file>` is four levels down in the
     // newer layout; the classic one is two.)
@@ -546,39 +543,84 @@ fn get_rlib_dependencies(
 
     fingerprint_paths.sort();
 
-    let fingerprints: Vec<_> = fingerprint_paths
-        .iter()
-        .filter_map(|path| Fingerprint::from_path(path, Some(&metadata)).ok())
-        .collect();
+    // A crate can have several builds of the very same version (different
+    // features, or built for build scripts), and rustc only accepts the one
+    // the other crates were compiled against. Cargo records, in each unit's
+    // fingerprint, which builds of its dependencies it used; so a build that
+    // other candidates were compiled against is the one to link.
+    struct Candidate {
+        finger: Fingerprint,
+        own_hash: Option<String>,
+    }
 
-    for finger in fingerprints {
+    let mut candidates = Vec::new();
+    for path in &fingerprint_paths {
+        let Ok(finger) = Fingerprint::from_path(path, Some(&metadata)) else {
+            continue;
+        };
         let name = finger.name();
-        let locked_ver = match locked_deps.get(&name) {
-            Some(ver) => ver,
-            None => continue,
+        let Some(locked_ver) = locked_deps.get(&name) else {
+            continue;
         };
         // A direct dependency is linked at the version the root package asked
-        // for, which may differ from the version of a transitive copy.
+        // for, which may differ from the version of a transitive copy. Only
+        // the exact version will do: a semver-compatible leftover build was
+        // not what this project resolved to. Unversioned entries (they might
+        // be workspace members) are kept, but never override versioned ones.
         let wanted = direct_deps.get(&name).unwrap_or(locked_ver);
+        if finger.version().is_some_and(|ver| ver != *wanted) {
+            continue;
+        }
+        let (own_hash, _) = unit_hashes(path);
+        candidates.push(Candidate { finger, own_hash });
+    }
 
-        match finger.version() {
-            // Only the exact locked version will do: a semver-compatible
-            // leftover build was not what this project resolved to.
-            Some(ver) if ver == *wanted => match found_deps.get(&name) {
-                // Of several builds of the same version, prefer the freshest.
-                Some(current) if current.version.is_some() && current.mtime >= finger.mtime => {}
-                _ => {
-                    found_deps.insert(name, finger);
+    // Count the builds that depend on each one, over every unit (including
+    // the root package's own test targets, which are the ground truth for
+    // what a snippet is compiled alongside).
+    let mut referrers: HashMap<String, usize> = HashMap::new();
+    for path in fingerprint_paths
+        .iter()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+    {
+        for hash in unit_hashes(path).1 {
+            *referrers.entry(hash).or_default() += 1;
+        }
+    }
+
+    // Prefer versioned, then most depended-upon, then freshest; on a tie the
+    // later path wins, which keeps the choice deterministic.
+    let rank = |candidate: &Candidate| {
+        (
+            candidate.finger.version.is_some(),
+            candidate
+                .own_hash
+                .as_ref()
+                .and_then(|hash| referrers.get(hash))
+                .copied()
+                .unwrap_or(0),
+            candidate.finger.mtime,
+        )
+    };
+    let mut best: std::collections::BTreeMap<String, &Candidate> =
+        std::collections::BTreeMap::new();
+    for candidate in &candidates {
+        let slot = best.entry(candidate.finger.name());
+        match slot {
+            std::collections::btree_map::Entry::Occupied(mut e) => {
+                if rank(candidate) >= rank(e.get()) {
+                    e.insert(candidate);
                 }
-            },
-            Some(_) => {}
-            // Unversioned entries (they might be workspace members) never
-            // override versioned ones.
-            None => {
-                found_deps.entry(name).or_insert(finger);
+            }
+            std::collections::btree_map::Entry::Vacant(e) => {
+                e.insert(candidate);
             }
         }
     }
+    let found_deps: std::collections::BTreeMap<String, Fingerprint> = best
+        .into_iter()
+        .map(|(name, candidate)| (name, candidate.finger.clone()))
+        .collect();
 
     let result: Vec<Fingerprint> = found_deps
         .into_iter()
@@ -601,6 +643,36 @@ fn get_rlib_dependencies(
     let _ = persistent_cache.save_to_file(&root_dir);
 
     Ok(result)
+}
+
+/// The fingerprint hash of a unit and of the dependency builds it was
+/// compiled against, as hex strings in the same (little-endian) form cargo
+/// stores in the extensionless `lib-<name>` file next to the JSON.
+fn unit_hashes(json_path: &Path) -> (Option<String>, HashSet<String>) {
+    let own = fs::read_to_string(json_path.with_extension(""))
+        .ok()
+        .map(|hash| hash.trim().to_owned());
+    let deps = fs::read_to_string(json_path)
+        .ok()
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+        .and_then(|json| {
+            let deps = json.get("deps")?.as_array()?.clone();
+            Some(
+                deps.iter()
+                    .filter_map(|dep| {
+                        // `[index, name, public, hash]`, or an object in
+                        // other cargo versions.
+                        let hash = dep
+                            .as_array()
+                            .and_then(|dep| dep.last())
+                            .or_else(|| dep.get("fingerprint"))?;
+                        Some(format!("{:016x}", hash.as_u64()?.swap_bytes()))
+                    })
+                    .collect(),
+            )
+        })
+        .unwrap_or_default();
+    (own, deps)
 }
 
 /// Populate the cache during the build phase to make test runs faster

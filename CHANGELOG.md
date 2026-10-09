@@ -6,7 +6,7 @@
 * Bumped minimal Rust version to 1.85
 * Replaced the unmaintained `bincode` with `serde_json` for the `.skeptic-cache` file (caches from older releases are rebuilt)
 * The dependency cache is only reused while every cached rlib still exists, and is written atomically so concurrent test processes cannot leave a torn `.skeptic-cache`
-* Of several builds of the same crate version, the freshest is used again, and only the exact locked version is linked (no more semver-compatible leftovers)
+* Only the exact locked version is linked (no more semver-compatible leftovers). Of several builds of that version, the one the most other units were compiled against (read from cargo's fingerprints, including the root package's test targets) is used, then the freshest, so a snippet sees the same `serde` as the crates it uses
 * Which version of a crate a build is, when the graph holds several, is read from the unit's dep-info file instead of guessing from feature names (the `rand`/`thread_rng` special case is gone)
 * The root package is found with `cargo metadata`'s own resolution and canonical paths (symlinks, Windows); virtual workspaces start from every workspace member as before
 * `cargo metadata` runs once per setup rather than three or more times, and package lookups are indexed
