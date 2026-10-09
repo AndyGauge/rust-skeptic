@@ -1,31 +1,29 @@
-use std::collections::btree_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::SystemTime;
 
 use cargo_metadata::Edition;
 
-use once_cell::sync::Lazy;
-use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use walkdir::WalkDir;
 
 // Persistent cache structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PersistentCache {
+pub(crate) struct PersistentCache {
     pub cache_version: u32, // Defensive versioning to invalidate cache when data format changes
     pub entries: HashMap<String, CacheEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CacheEntry {
+pub(crate) struct CacheEntry {
     fingerprints: Vec<Fingerprint>,
     cache_key_hash: u64,
     created_at: SystemTime,
@@ -75,7 +73,10 @@ impl PersistentCache {
         let data = serde_json::to_vec(self).map_err(|e| {
             SkepticError::Io(std::io::Error::other(format!("Serialization error: {}", e)))
         })?;
-        fs::write(&cache_file, data)?;
+        // Write-then-rename so a concurrent reader never sees a torn file.
+        let mut tmp = tempfile::NamedTempFile::new_in(root_dir)?;
+        std::io::Write::write_all(&mut tmp, &data)?;
+        tmp.persist(&cache_file).map_err(|e| e.error)?;
         Ok(())
     }
 
@@ -169,8 +170,8 @@ struct Prepared {
 
 type PreparedKey = (String, String);
 
-static PREPARED: Lazy<Mutex<HashMap<PreparedKey, Arc<Prepared>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static PREPARED: LazyLock<Mutex<HashMap<PreparedKey, Arc<Prepared>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Forget everything cached in memory and on disk for `root_dir`, so the next
 /// snippet pays the full setup cost. Intended for benchmarks.
@@ -244,11 +245,12 @@ fn prepare(root_dir: &str, target_dir: &str) -> Arc<Prepared> {
         None
     };
 
-    let externs: Vec<(String, PathBuf)> = get_rlib_dependencies(root_dir, target_dir.clone())
-        .expect("failed to read dependencies")
-        .into_iter()
-        .map(|dep| (dep.libname, dep.rlib))
-        .collect();
+    let externs: Vec<(String, PathBuf)> =
+        get_rlib_dependencies(root_dir, target_dir.clone(), Some(metadata))
+            .expect("failed to read dependencies")
+            .into_iter()
+            .map(|dep| (dep.libname, dep.rlib))
+            .collect();
 
     // In the newer layout every unit's rlibs live in their own directory, and
     // rustc must be able to see all of them: a dependency may have been built
@@ -294,6 +296,18 @@ struct Outcome {
     steps: Vec<Captured>,
 }
 
+impl Outcome {
+    fn failed(failure: String) -> Outcome {
+        Outcome {
+            steps: vec![Captured {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                failure: Some(failure),
+            }],
+        }
+    }
+}
+
 struct Job {
     work: Box<dyn FnOnce() -> Outcome + Send>,
     reply: Sender<Outcome>,
@@ -305,13 +319,13 @@ fn worker_count() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|&n| n > 0)
-        .unwrap_or_else(num_cpus::get)
+        .unwrap_or_else(|| thread::available_parallelism().map_or(1, |n| n.get()))
 }
 
 /// A fixed pool of workers fed by a queue. libtest runs each generated test
 /// on its own thread; those threads only enqueue and wait, so the number of
 /// concurrent `rustc` processes stays bounded.
-static QUEUE: Lazy<Mutex<Sender<Job>>> = Lazy::new(|| {
+static QUEUE: LazyLock<Mutex<Sender<Job>>> = LazyLock::new(|| {
     let (tx, rx) = mpsc::channel::<Job>();
     let rx = Arc::new(Mutex::new(rx));
     for _ in 0..worker_count() {
@@ -321,7 +335,12 @@ static QUEUE: Lazy<Mutex<Sender<Job>>> = Lazy::new(|| {
                 Ok(job) => job,
                 Err(_) => return,
             };
-            let _ = job.reply.send((job.work)());
+            // A panicking snippet must not take its worker down with it: the
+            // pool is never replenished, so the remaining tests would hang.
+            let outcome = panic::catch_unwind(AssertUnwindSafe(job.work)).unwrap_or_else(|_| {
+                Outcome::failed("skeptic worker panicked while running a snippet".to_owned())
+            });
+            let _ = job.reply.send(outcome);
         });
     }
     Mutex::new(tx)
@@ -353,8 +372,8 @@ fn handle_test(
     // Report from the test's own thread so libtest attributes output and
     // panics (including `should_panic`) to the right test.
     for step in outcome.steps {
-        print!("{}", String::from_utf8(step.stdout).unwrap());
-        eprint!("{}", String::from_utf8(step.stderr).unwrap());
+        print!("{}", String::from_utf8_lossy(&step.stdout));
+        eprint!("{}", String::from_utf8_lossy(&step.stderr));
         if let Some(failure) = step.failure {
             panic!("{}", failure);
         }
@@ -367,12 +386,18 @@ fn execute(
     test_text: &str,
     compile_type: CompileType,
 ) -> Outcome {
-    let out_dir = tempfile::Builder::new()
-        .prefix("rust-skeptic")
-        .tempdir()
-        .unwrap();
+    let out_dir = match tempfile::Builder::new().prefix("rust-skeptic").tempdir() {
+        Ok(dir) => dir,
+        Err(e) => return Outcome::failed(format!("Could not create a temp dir: {}", e)),
+    };
     let testcase_path = out_dir.path().join("test.rs");
-    fs::write(&testcase_path, test_text.as_bytes()).unwrap();
+    if let Err(e) = fs::write(&testcase_path, test_text.as_bytes()) {
+        return Outcome::failed(format!(
+            "Could not write {}: {}",
+            testcase_path.display(),
+            e
+        ));
+    }
 
     // We use rustc directly, telling it where the rlibs are with -L and
     // their names with --extern (resolved once in `prepare`).
@@ -432,7 +457,16 @@ fn execute(
 }
 
 fn capture(mut command: Command) -> Captured {
-    let output = command.output().unwrap();
+    let output = match command.output() {
+        Ok(output) => output,
+        Err(e) => {
+            return Captured {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                failure: Some(format!("Could not run {:?}: {}", command, e)),
+            }
+        }
+    };
     let failure = if output.status.success() {
         None
     } else {
@@ -447,49 +481,55 @@ fn capture(mut command: Command) -> Captured {
 
 // Retrieve the exact dependencies for a given build by
 // cross-referencing the lockfile with the fingerprint file
-fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<Fingerprint>> {
+fn get_rlib_dependencies(
+    root_dir: PathBuf,
+    target_dir: PathBuf,
+    metadata: Option<cargo_metadata::Metadata>,
+) -> Result<Vec<Fingerprint>> {
     let cache_key_str = format!("{}:{}", root_dir.display(), target_dir.display());
     let cache_key_hash = PersistentCache::generate_cache_key_hash(&root_dir, &target_dir);
 
     let mut persistent_cache = PersistentCache::load_from_file(&root_dir)?;
 
-    let lock = LockedDeps::from_path(root_dir.clone()).or_else(|_| {
-        // could not find Cargo.lock in $CARGO_MAINFEST_DIR
-        // try relative to target_dir
-        let mut root_dir = target_dir.clone();
-        root_dir.pop();
-        root_dir.pop();
-        LockedDeps::from_path(root_dir)
-    })?;
+    // `cargo metadata` is slow, so run it at most once per call (callers that
+    // already have it pass it in).
+    let metadata = match metadata {
+        Some(metadata) => metadata,
+        None => get_cargo_meta(root_dir.join("Cargo.toml"))?,
+    };
+    let lock =
+        LockedDeps::from_metadata(&metadata, &root_dir.join("Cargo.toml")).or_else(|_| {
+            // could not find Cargo.lock in $CARGO_MAINFEST_DIR
+            // try relative to target_dir
+            let mut root_dir = target_dir.clone();
+            root_dir.pop();
+            root_dir.pop();
+            LockedDeps::from_path(root_dir)
+        })?;
 
     // Get direct dependencies first before consuming the lock
     let direct_deps = lock.get_direct_dependencies().clone();
     let locked_deps: HashMap<String, String> = lock.collect();
 
-    // Check if cached dependencies are still valid by ensuring key dependencies are present
-    // This helps detect when new dependencies have been added to Cargo.lock
+    // Check if cached dependencies are still valid: every locked dependency
+    // must be represented (this detects dependencies added to Cargo.lock) and
+    // every cached rlib must still exist (a rebuild replaces them).
     if let Some(cached_deps) = persistent_cache.get(&cache_key_str, cache_key_hash) {
         let cached_dep_names: HashSet<String> =
             cached_deps.iter().map(|d| d.name().to_string()).collect();
 
-        // Check if all locked dependencies are represented in the cache
-        let missing_deps: Vec<&String> = locked_deps
+        let all_present = locked_deps
             .keys()
-            .filter(|dep_name| !cached_dep_names.contains(*dep_name))
-            .collect();
+            .all(|dep_name| cached_dep_names.contains(dep_name));
+        let all_exist = cached_deps.iter().all(|d| d.rlib.exists());
 
-        if missing_deps.is_empty() {
-            // Cache is valid - all expected dependencies are present
+        if all_present && all_exist {
             return Ok(cached_deps.clone());
         }
     }
 
     let fingerprint_dir =
         fingerprint_root(&target_dir).unwrap_or_else(|| target_dir.join(".fingerprint"));
-
-    // Get cargo metadata once and reuse it for all fingerprints
-    let metadata_path = root_dir.join("Cargo.toml");
-    let metadata = get_cargo_meta(&metadata_path).ok();
 
     let mut found_deps: std::collections::BTreeMap<String, Fingerprint> =
         std::collections::BTreeMap::new();
@@ -508,124 +548,34 @@ fn get_rlib_dependencies(root_dir: PathBuf, target_dir: PathBuf) -> Result<Vec<F
 
     let fingerprints: Vec<_> = fingerprint_paths
         .iter()
-        .filter_map(|path| Fingerprint::from_path(path, metadata.as_ref()).ok())
+        .filter_map(|path| Fingerprint::from_path(path, Some(&metadata)).ok())
         .collect();
 
     for finger in fingerprints {
-        let locked_ver = match locked_deps.get(&finger.name()) {
+        let name = finger.name();
+        let locked_ver = match locked_deps.get(&name) {
             Some(ver) => ver,
             None => continue,
         };
+        // A direct dependency is linked at the version the root package asked
+        // for, which may differ from the version of a transitive copy.
+        let wanted = direct_deps.get(&name).unwrap_or(locked_ver);
 
-        // Check if this is a direct dependency that requires strict version matching
-        let is_direct_dep = direct_deps.contains_key(&finger.name());
-        let required_version = if is_direct_dep {
-            Some(&direct_deps[&finger.name()])
-        } else {
-            None
-        };
-        match (found_deps.entry(finger.name()), finger.version()) {
-            (Entry::Occupied(mut e), Some(ver)) => {
-                // For direct dependencies, require exact version match
-                if let Some(req_ver) = required_version {
-                    if *req_ver == ver {
-                        e.insert(finger);
-                    }
-                } else {
-                    // For transitive dependencies, use the existing logic
-                    // First try exact version match (highest priority)
-                    if *locked_ver == ver {
-                        e.insert(finger);
-                    } else {
-                        // Then try semantic version matching
-                        if let (Ok(req), Ok(version)) =
-                            (VersionReq::parse(locked_ver), Version::parse(&ver))
-                        {
-                            if req.matches(&version) {
-                                // Only replace if we don't have an exact match already
-                                let current = e.get();
-                                if let Some(current_ver) = &current.version {
-                                    if *locked_ver != *current_ver {
-                                        // If current is not an exact match, replace with this one
-                                        e.insert(finger);
-                                    }
-                                } else {
-                                    e.insert(finger);
-                                }
-                            }
-                        } else {
-                            // Fallback: try to parse the locked version as a semver requirement
-                            // This handles cases where the project specifies "0.8" but Cargo resolves to "0.8.5"
-                            let req_str = if locked_ver.matches('.').count() == 1 {
-                                // If it's like "0.8", convert to "^0.8.0"
-                                format!("^{}.0", locked_ver)
-                            } else {
-                                // If it's already a full version like "0.8.5", convert to "^0.8.5"
-                                format!("^{}", locked_ver)
-                            };
-
-                            if let (Ok(req), Ok(version)) =
-                                (VersionReq::parse(&req_str), Version::parse(&ver))
-                            {
-                                if req.matches(&version) {
-                                    let current = e.get();
-                                    if let Some(current_ver) = &current.version {
-                                        if *locked_ver != *current_ver {
-                                            e.insert(finger);
-                                        }
-                                    } else {
-                                        e.insert(finger);
-                                    }
-                                }
-                            } else {
-                                // Final fallback to exact match if parsing fails
-                                if *locked_ver == ver && e.get().mtime < finger.mtime {
-                                    e.insert(finger);
-                                }
-                            }
-                        }
-                    }
+        match finger.version() {
+            // Only the exact locked version will do: a semver-compatible
+            // leftover build was not what this project resolved to.
+            Some(ver) if ver == *wanted => match found_deps.get(&name) {
+                // Of several builds of the same version, prefer the freshest.
+                Some(current) if current.version.is_some() && current.mtime >= finger.mtime => {}
+                _ => {
+                    found_deps.insert(name, finger);
                 }
-            }
-            (Entry::Vacant(e), Some(ver)) => {
-                // For direct dependencies, require exact version match
-                if let Some(req_ver) = required_version {
-                    if *req_ver == ver {
-                        e.insert(finger);
-                    }
-                } else if *locked_ver == ver {
-                    e.insert(finger);
-                } else if let (Ok(req), Ok(version)) =
-                    (VersionReq::parse(locked_ver), Version::parse(&ver))
-                {
-                    if req.matches(&version) {
-                        e.insert(finger);
-                    }
-                } else {
-                    let req_str = if locked_ver.matches('.').count() == 1 {
-                        format!("^{}.0", locked_ver)
-                    } else {
-                        format!("^{}", locked_ver)
-                    };
-
-                    if let (Ok(req), Ok(version)) =
-                        (VersionReq::parse(&req_str), Version::parse(&ver))
-                    {
-                        if req.matches(&version) {
-                            e.insert(finger);
-                        }
-                    } else if *locked_ver == ver {
-                        e.insert(finger);
-                    }
-                }
-            }
-            (Entry::Vacant(e), None) => {
-                // For unversioned entries, insert them (they might be workspace members)
-                e.insert(finger);
-            }
-            (Entry::Occupied(_), None) => {
-                // If we already have an entry and this one is unversioned, skip it
-                // This prevents unversioned entries from overriding versioned ones
+            },
+            Some(_) => {}
+            // Unversioned entries (they might be workspace members) never
+            // override versioned ones.
+            None => {
+                found_deps.entry(name).or_insert(finger);
             }
         }
     }
@@ -671,7 +621,7 @@ pub fn populate_cache_during_build(root_dir: &Path, target_triple: &str) -> Resu
             return Ok(true);
         }
 
-        let _ = get_rlib_dependencies(root_dir.to_path_buf(), target_dir.to_path_buf())?;
+        let _ = get_rlib_dependencies(root_dir.to_path_buf(), target_dir.to_path_buf(), None)?;
         Ok(true)
     }
 
@@ -709,7 +659,7 @@ pub fn populate_cache_during_build(root_dir: &Path, target_triple: &str) -> Resu
 
 // An iterator over the root dependencies in a lockfile
 #[derive(Debug)]
-pub struct LockedDeps {
+pub(crate) struct LockedDeps {
     dependencies: Vec<(String, String)>,
     direct_dependencies: HashMap<String, String>,
 }
@@ -722,74 +672,85 @@ fn get_cargo_meta<P: AsRef<Path> + std::convert::AsRef<std::ffi::OsStr>>(
         .exec()?)
 }
 
-// Update LockedDeps to accept a package name
 impl LockedDeps {
-    pub fn from_path<P: AsRef<Path>>(path: P) -> Result<LockedDeps> {
+    pub(crate) fn from_path<P: AsRef<Path>>(path: P) -> Result<LockedDeps> {
         let path = path.as_ref().join("Cargo.toml");
         let metadata = get_cargo_meta(&path)?;
+        Self::from_metadata(&metadata, &path)
+    }
+
+    pub(crate) fn from_metadata(
+        metadata: &cargo_metadata::Metadata,
+        manifest_path: &Path,
+    ) -> Result<LockedDeps> {
         let resolve = metadata
             .resolve
+            .as_ref()
             .ok_or(SkepticError::MissingDependencyMetadata)?;
-        let all_nodes: std::collections::HashMap<_, _> = resolve
-            .nodes
-            .into_iter()
-            .map(|node| (node.id.clone(), node))
-            .collect();
-        // Find the root package (the one matching the manifest path)
-        let root_package = metadata
-            .packages
-            .iter()
-            .find(|pkg| pkg.manifest_path.as_str() == path.to_str().unwrap())
-            .ok_or(SkepticError::RootPackageNotFound)?;
-        let root_id = &root_package.id;
+        let all_nodes: HashMap<_, _> = resolve.nodes.iter().map(|node| (&node.id, node)).collect();
+        // Look names and versions up in the package list rather than parsing
+        // the package id, whose format differs between cargo versions.
+        let packages: HashMap<_, _> = metadata.packages.iter().map(|p| (&p.id, p)).collect();
 
-        // First, collect direct dependencies with their versions
-        let mut direct_deps = std::collections::HashMap::new();
-        if let Some(root_node) = all_nodes.get(root_id) {
-            // Collect direct dependencies first
-            for dep_id in &root_node.dependencies {
-                if let Some(pkg) = metadata.packages.iter().find(|p| &p.id == dep_id) {
-                    let name = pkg.name.replace('-', "_");
-                    direct_deps.insert(name.clone(), pkg.version.to_string());
-                }
-            }
-
-            // Then walk transitive dependencies, but don't override direct dependencies
-            let mut all_deps = std::collections::HashSet::new();
-            all_deps.insert(root_node.id.clone());
-            let mut to_visit = root_node.dependencies.clone();
-            while let Some(dep_id) = to_visit.pop() {
-                if all_deps.insert(dep_id.clone()) {
-                    if let Some(dep_node) = all_nodes.get(&dep_id) {
-                        to_visit.extend(dep_node.dependencies.clone());
-                    }
-                }
-            }
-
-            // Collect all dependencies, prioritizing direct ones
-            let mut dep_pairs = Vec::new();
-            for node_id in &all_deps {
-                if let Some(pkg) = metadata.packages.iter().find(|p| &p.id == node_id) {
-                    let name = pkg.name.replace('-', "_");
-                    let version = pkg.version.to_string();
-
-                    // If this is a direct dependency, use it
-                    if direct_deps.contains_key(&name) {
-                        dep_pairs.push((name.clone(), direct_deps[&name].clone()));
-                    } else {
-                        // Otherwise, use the transitive dependency version
-                        dep_pairs.push((name, version));
-                    }
-                }
-            }
-
-            Ok(LockedDeps {
-                dependencies: dep_pairs,
-                direct_dependencies: direct_deps,
+        // The package whose manifest this is. Compare canonical paths so that
+        // symlinks and separators don't matter; a virtual workspace has no
+        // such package, so it starts from every workspace member (as the
+        // original implementation did).
+        let canonical = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let manifest = canonical(manifest_path);
+        let root_ids: Vec<&cargo_metadata::PackageId> = metadata
+            .root_package()
+            .or_else(|| {
+                metadata
+                    .packages
+                    .iter()
+                    .find(|pkg| canonical(pkg.manifest_path.as_std_path()) == manifest)
             })
-        } else {
-            Err(SkepticError::RootPackageNotFound)
+            .map(|pkg| vec![&pkg.id])
+            .unwrap_or_else(|| metadata.workspace_members.iter().collect());
+        if root_ids.is_empty() {
+            return Err(SkepticError::RootPackageNotFound);
         }
+
+        let mut direct_deps = HashMap::new();
+        let mut to_visit = Vec::new();
+        for id in &root_ids {
+            let node = all_nodes.get(id).ok_or(SkepticError::RootPackageNotFound)?;
+            for dep_id in &node.dependencies {
+                if let Some(pkg) = packages.get(dep_id) {
+                    direct_deps.insert(pkg.name.replace('-', "_"), pkg.version.to_string());
+                }
+                to_visit.push(dep_id);
+            }
+        }
+
+        // Walk the transitive dependencies.
+        let mut all_deps: HashSet<&cargo_metadata::PackageId> = root_ids.iter().copied().collect();
+        while let Some(dep_id) = to_visit.pop() {
+            if all_deps.insert(dep_id) {
+                if let Some(dep_node) = all_nodes.get(dep_id) {
+                    to_visit.extend(dep_node.dependencies.iter());
+                }
+            }
+        }
+
+        // Collect all dependencies, preferring the direct dependency's version
+        let mut dep_pairs = Vec::new();
+        for node_id in &all_deps {
+            if let Some(pkg) = packages.get(node_id) {
+                let name = pkg.name.replace('-', "_");
+                let version = direct_deps
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_else(|| pkg.version.to_string());
+                dep_pairs.push((name, version));
+            }
+        }
+
+        Ok(LockedDeps {
+            dependencies: dep_pairs,
+            direct_dependencies: direct_deps,
+        })
     }
 
     pub fn get_direct_dependencies(&self) -> &HashMap<String, String> {
@@ -805,7 +766,7 @@ impl Iterator for LockedDeps {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Fingerprint {
+pub(crate) struct Fingerprint {
     pub libname: String,
     pub version: Option<String>, // version might not be present on path or vcs deps
     pub rlib: PathBuf,
@@ -844,105 +805,49 @@ fn fingerprint_identity(path: &Path) -> Option<(String, String)> {
     Some((name_parts.join("_"), hash.to_owned()))
 }
 
-fn extract_version_from_fingerprint<P: AsRef<Path>>(
-    path: P,
+/// Which version of a crate a build unit is, when the graph holds several.
+///
+/// A unit's dep-info file (`<lib>-<hash>.d`) lists the source files it was
+/// compiled from, so the package whose directory they live in is the one.
+fn version_from_dep_info(
+    dep_info: &Path,
+    candidates: &[&cargo_metadata::Package],
+) -> Option<String> {
+    let content = fs::read_to_string(dep_info).ok()?;
+    candidates
+        .iter()
+        .find(|pkg| {
+            let dir = pkg.manifest_path.parent().map(|d| d.as_str().to_owned());
+            dir.is_some_and(|dir| {
+                // Anchor on a separator so 0.8.5 doesn't match 0.8.50.
+                content.contains(&format!("{}/", dir)) || content.contains(&format!("{}\\", dir))
+            })
+        })
+        .map(|pkg| pkg.version.to_string())
+}
+
+fn extract_version_from_fingerprint(
+    path: &Path,
+    dep_info: &Path,
     metadata: Option<&cargo_metadata::Metadata>,
-) -> Result<Option<String>> {
-    let path = path.as_ref();
+) -> Option<String> {
+    let metadata = metadata?;
+    let (lib_name, _) = fingerprint_identity(path)?;
+    let mut matching_packages: Vec<_> = metadata
+        .packages
+        .iter()
+        .filter(|pkg| pkg.name.replace('-', "_") == lib_name)
+        .collect();
 
-    // First, try to extract version from the directory name using cached metadata
-    if let Some(metadata) = metadata {
-        if let Some(parent) = path.parent() {
-            if let Some((lib_name, _)) = fingerprint_identity(path) {
-                // Find all packages with this name
-                let matching_packages: Vec<_> = metadata
-                    .packages
-                    .iter()
-                    .filter(|pkg| pkg.name.replace('-', "_") == lib_name)
-                    .collect();
-
-                match matching_packages.len() {
-                    1 => {
-                        // Only one version, use it
-                        return Ok(Some(matching_packages[0].version.to_string()));
-                    }
-                    n if n > 1 => {
-                        // Multiple versions - need to read fingerprint JSON to determine which one
-                        let json_path =
-                            parent.join(format!("lib-{}.json", lib_name.replace('_', "-")));
-                        if json_path.exists() {
-                            if let Ok(json_content) = std::fs::read_to_string(&json_path) {
-                                if let Ok(fingerprint_data) =
-                                    serde_json::from_str::<serde_json::Value>(&json_content)
-                                {
-                                    if let Some(features) = fingerprint_data
-                                        .get("features")
-                                        .and_then(|f| f.as_str())
-                                        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
-                                    {
-                                        // Try to match features against package versions
-                                        for pkg in &matching_packages {
-                                            // Check if this package's features match the fingerprint
-                                            if lib_name == "rand" {
-                                                // For rand, use thread_rng as a distinguishing feature
-                                                let has_thread_rng =
-                                                    features.contains(&"thread_rng".to_string());
-                                                let pkg_has_thread_rng =
-                                                    pkg.features.contains_key("thread_rng");
-
-                                                if has_thread_rng == pkg_has_thread_rng {
-                                                    return Ok(Some(pkg.version.to_string()));
-                                                }
-                                            } else {
-                                                // For other packages, use a more general approach
-                                                // This is a simplified check - in practice, you might need more sophisticated matching
-                                                let feature_set: std::collections::HashSet<_> =
-                                                    features.iter().collect();
-                                                let pkg_feature_set: std::collections::HashSet<_> =
-                                                    pkg.features.keys().collect();
-
-                                                // Check if there's significant overlap
-                                                let intersection_count = feature_set
-                                                    .intersection(&pkg_feature_set)
-                                                    .count();
-                                                if intersection_count > 0 {
-                                                    return Ok(Some(pkg.version.to_string()));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // If we can't determine from features, fall back to highest version
-                        let mut sorted_packages = matching_packages;
-                        sorted_packages.sort_by(|a, b| b.version.cmp(&a.version)); // Sort descending
-                        return Ok(Some(sorted_packages[0].version.to_string()));
-                    }
-                    _ => {
-                        // No matching packages - continue to fallback logic
-                    }
-                }
-            }
-        }
+    match matching_packages.len() {
+        0 => None,
+        1 => Some(matching_packages[0].version.to_string()),
+        _ => version_from_dep_info(dep_info, &matching_packages).or_else(|| {
+            // Can't tell: fall back to the highest version.
+            matching_packages.sort_by(|a, b| b.version.cmp(&a.version));
+            Some(matching_packages[0].version.to_string())
+        }),
     }
-
-    // Fallback to the original logic - try to find version in the fingerprint file
-    if let Ok(content) = fs::read_to_string(path) {
-        for line in content.lines() {
-            if line.contains("version:") {
-                if let Some(version) = line.split("version:").nth(1) {
-                    let version = version.trim();
-                    if !version.is_empty() {
-                        return Ok(Some(version.to_string()));
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(None)
 }
 
 impl Fingerprint {
@@ -982,8 +887,8 @@ impl Fingerprint {
         let rlib =
             guess_ext(rlib, &["rlib", "so", "dylib"]).or_else(|_| guess_ext(dll, &["dll"]))?;
 
-        // Try to extract version from the fingerprint file content
-        let version = extract_version_from_fingerprint(path, metadata)?;
+        let dep_info = rlib.with_file_name(format!("{}-{}.d", libname, hash));
+        let version = extract_version_from_fingerprint(path, &dep_info, metadata);
 
         Ok(Fingerprint {
             libname,
@@ -1132,5 +1037,22 @@ mod cache_format_tests {
             entry.fingerprints[0].rlib,
             Path::new("/t/deps/libserde-abc.rlib")
         );
+    }
+}
+
+#[cfg(test)]
+mod cache_write_tests {
+    use super::*;
+
+    #[test]
+    fn save_leaves_only_the_cache_file() {
+        let dir = tempfile::tempdir().unwrap();
+        PersistentCache::new().save_to_file(dir.path()).unwrap();
+        PersistentCache::new().save_to_file(dir.path()).unwrap();
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [".skeptic-cache"]);
     }
 }
