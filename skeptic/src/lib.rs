@@ -10,6 +10,10 @@ use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Parser, Tag};
 use crate::rt::SkepticError;
 
 mod binary_cache;
+
+/// Language server reporting compile errors and test panics on save.
+#[cfg(feature = "lsp")]
+pub use skeptic_lsp as lsp;
 pub mod rt;
 #[cfg(test)]
 mod tests;

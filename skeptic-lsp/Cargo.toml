@@ -1,0 +1,18 @@
+[package]
+description = "Language server that reports cargo compile errors and test panics on save"
+license = "MIT OR Apache-2.0"
+name = "skeptic-lsp"
+version = "0.1.0"
+repository = "https://github.com/budziq/rust-skeptic"
+edition = "2021"
+rust-version = "1.85"
+
+[[bin]]
+name = "skeptic-lsp"
+path = "src/main.rs"
+
+[dependencies]
+cargo_metadata = "0.15"
+serde_json = "1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "process", "sync"] }
+tower-lsp = "0.20"

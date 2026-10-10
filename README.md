@@ -266,6 +266,34 @@ skeptic = { version = "0.14", features = ["binary-cache"] }
 
 Set `SKEPTIC_NO_BINARY_CACHE` to skip it for a single run.
 
+## Language server
+
+The optional `skeptic-lsp` crate is a [tower-lsp](https://crates.io/crates/tower-lsp)
+language server. When a `.rs` file or `Cargo.toml` is saved it runs
+`cargo test --no-fail-fast` for the workspace and publishes diagnostics for
+compile errors/warnings and for tests that fail with a `panic!`/`assert!`
+(placed on the panic location). Run it as a binary (`cargo install --path skeptic-lsp`),
+Saving a markdown file that skeptic tests reports snippet compile errors and panics on the
+matching markdown lines. Or enable the `lsp` feature of `skeptic` to get it as `skeptic::lsp::run_stdio()`:
+
+```toml
+skeptic = { version = "0.15", features = ["lsp"] }
+```
+
+Extra `cargo test` arguments can be passed via `initializationOptions`,
+e.g. `{ "args": ["--workspace"] }`.
+
+### Zed
+
+`zed-extension/` is a [Zed](https://zed.dev) extension that starts `skeptic-lsp`
+for Rust files. Install the binary (`cargo install --path skeptic-lsp`), then in Zed
+run `zed: install dev extension` and pick the `zed-extension` directory. Pass
+cargo arguments in Zed's `settings.json`:
+
+```json
+{ "lsp": { "skeptic-lsp": { "initialization_options": { "args": ["--workspace"] } } } }
+```
+
 ## License
 
 Licensed under either of
