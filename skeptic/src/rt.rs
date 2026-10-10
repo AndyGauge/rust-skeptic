@@ -43,12 +43,12 @@ impl PersistentCache {
         }
     }
 
-    pub fn get_cache_file_path(root_dir: &Path) -> PathBuf {
-        root_dir.join(".skeptic-cache")
+    pub fn get_cache_file_path(dir: &Path) -> PathBuf {
+        dir.join(".skeptic-cache")
     }
 
-    pub fn load_from_file(root_dir: &Path) -> Result<Self> {
-        let cache_file = Self::get_cache_file_path(root_dir);
+    pub fn load_from_file(dir: &Path) -> Result<Self> {
+        let cache_file = Self::get_cache_file_path(dir);
         if !cache_file.exists() {
             return Ok(Self::new());
         }
@@ -68,13 +68,13 @@ impl PersistentCache {
         }
     }
 
-    pub fn save_to_file(&self, root_dir: &Path) -> Result<()> {
-        let cache_file = Self::get_cache_file_path(root_dir);
+    pub fn save_to_file(&self, dir: &Path) -> Result<()> {
+        let cache_file = Self::get_cache_file_path(dir);
         let data = serde_json::to_vec(self).map_err(|e| {
             SkepticError::Io(std::io::Error::other(format!("Serialization error: {}", e)))
         })?;
         // Write-then-rename so a concurrent reader never sees a torn file.
-        let mut tmp = tempfile::NamedTempFile::new_in(root_dir)?;
+        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
         std::io::Write::write_all(&mut tmp, &data)?;
         tmp.persist(&cache_file).map_err(|e| e.error)?;
         Ok(())
@@ -178,7 +178,21 @@ static PREPARED: LazyLock<Mutex<HashMap<PreparedKey, Arc<Prepared>>>> =
 #[doc(hidden)]
 pub fn clear_caches(root_dir: &str) {
     PREPARED.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    let _ = fs::remove_file(PersistentCache::get_cache_file_path(Path::new(root_dir)));
+    // The cache lives in each `target/[<triple>/]<profile>` directory.
+    let target = Path::new(root_dir).join("target");
+    let mut dirs = vec![target.clone()];
+    dirs.extend(
+        fs::read_dir(&target)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path()),
+    );
+    for dir in dirs {
+        for profile in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let _ = fs::remove_file(PersistentCache::get_cache_file_path(&profile.path()));
+        }
+    }
 }
 
 /// The `target/<profile>` directory, found from a build script's `OUT_DIR`.
@@ -432,6 +446,17 @@ fn execute(
             libname,
             rlib.to_str().expect("filename not utf8"),
         ));
+        // With -Zembed-metadata=no (cargo's default on newer nightlies) the
+        // rlib holds only a stub, and rustc wants the sibling .rmeta too.
+        let rmeta = rlib.with_extension("rmeta");
+        if rlib.extension().is_some_and(|e| e == "rlib") && rmeta.exists() {
+            cmd.arg("--extern");
+            cmd.arg(format!(
+                "{}={}",
+                libname,
+                rmeta.to_str().expect("filename not utf8"),
+            ));
+        }
     }
 
     let binary_path = out_dir.path().join("out.exe");
@@ -489,7 +514,7 @@ fn get_rlib_dependencies(
     let cache_key_str = format!("{}:{}", root_dir.display(), target_dir.display());
     let cache_key_hash = PersistentCache::generate_cache_key_hash(&root_dir, &target_dir);
 
-    let mut persistent_cache = PersistentCache::load_from_file(&root_dir)?;
+    let mut persistent_cache = PersistentCache::load_from_file(&target_dir)?;
 
     // `cargo metadata` is slow, so run it at most once per call (callers that
     // already have it pass it in).
@@ -640,7 +665,7 @@ fn get_rlib_dependencies(
 
     // Save to persistent cache
     persistent_cache.insert(cache_key_str, result.clone(), cache_key_hash);
-    let _ = persistent_cache.save_to_file(&root_dir);
+    let _ = persistent_cache.save_to_file(&target_dir);
 
     Ok(result)
 }
@@ -685,7 +710,7 @@ pub fn populate_cache_during_build(root_dir: &Path, target_triple: &str) -> Resu
         let cache_key_str = format!("{}:{}", root_dir.display(), target_dir.display());
         let cache_key_hash = PersistentCache::generate_cache_key_hash(root_dir, target_dir);
 
-        let persistent_cache = PersistentCache::load_from_file(root_dir)?;
+        let persistent_cache = PersistentCache::load_from_file(target_dir)?;
         if persistent_cache
             .get(&cache_key_str, cache_key_hash)
             .is_some()

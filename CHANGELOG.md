@@ -1,3 +1,8 @@
+# 0.14.1
+
+* The `.skeptic-cache` file now lives in the target directory (`target/<profile>/`) instead of the project root, so `cargo clean` removes it and it needs no `.gitignore` entry
+* Fix dependencies built with `-Zembed-metadata=no` (the default on newer nightlies): the sibling `.rmeta` is passed to rustc along with the `.rlib`
+
 # 0.14.0
 
 * [Skeptic fails to find dependencies starting with Rust 1.77](https://github.com/budziq/rust-skeptic/issues/141)
