@@ -1,4 +1,4 @@
-# 0.14.2 (unreleased)
+# 0.14.2
 
 * Fix snippets linking the wrong build of a dependency when `target/` holds several (the same crate built with other features): the dependencies are now those the running test binary was linked with, read from its fingerprint and followed transitively. Which build of a dependency is chosen no longer varies from run to run
 * The dependency cache is now reused for projects whose `Cargo.lock` lists crates that are never built on this platform (it never was, so every run walked the fingerprints again)
