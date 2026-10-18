@@ -3,9 +3,9 @@ name = "Skeptic"
 version = "0.1.0"
 schema_version = 1
 authors = ["Andy Gauge <andygauge@gmail.com>"]
-description = "Runs cargo test on save and shows compile errors and test panics as diagnostics."
+description = "Shows compile errors and panics of the code snippets in your markdown, from skeptic, when you save."
 repository = "https://github.com/budziq/rust-skeptic"
 
 [language_servers.skeptic-lsp]
 name = "Skeptic LSP"
-languages = ["Rust", "Markdown"]
+languages = ["Markdown"]

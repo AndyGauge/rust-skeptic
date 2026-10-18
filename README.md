@@ -269,26 +269,38 @@ Set `SKEPTIC_NO_BINARY_CACHE` to skip it for a single run.
 ## Language server
 
 The optional `skeptic-lsp` crate is a [tower-lsp](https://crates.io/crates/tower-lsp)
-language server. When a `.rs` file or `Cargo.toml` is saved it runs
-`cargo test --no-fail-fast` for the workspace and publishes diagnostics for
-compile errors/warnings and for tests that fail with a `panic!`/`assert!`
-(placed on the panic location). Run it as a binary (`cargo install --path skeptic-lsp`),
-Saving a markdown file that skeptic tests reports snippet compile errors and panics on the
-matching markdown lines. Or enable the `lsp` feature of `skeptic` to get it as `skeptic::lsp::run_stdio()`:
+language server for the code blocks in your markdown. When a markdown file that skeptic
+tests is saved it runs only that file's snippets (`cargo test --no-fail-fast`) and reports,
+on the matching markdown lines,
+
+* snippets that do not compile (rustc's errors and warnings, from cargo's JSON messages), and
+* snippets that panic when run (on the panic location).
+
+Code block headers are respected, as in the tests themselves: `ignore` is not looked at,
+`no_run` is only compiled, a `should_panic` block is reported when it does not compile or
+when it runs to completion, and `no_run,should_panic` expects the compile to fail.
+
+Rust sources and `Cargo.toml` are left to rust-analyzer: saving them does nothing, and
+nothing found in them is reported. To also re-run the snippets when those are saved (a
+snippet depends on the code it tests) and to see their test panics, pass `"rust": true`.
+
+Run it as a binary (`cargo install --path skeptic-lsp`), or enable the `lsp` feature of
+`skeptic` to get it as `skeptic::lsp::run_stdio()`:
 
 ```toml
 skeptic = { version = "0.15", features = ["lsp"] }
 ```
 
-Extra `cargo test` arguments can be passed via `initializationOptions`,
-e.g. `{ "args": ["--workspace"] }`.
+Extra `cargo test` arguments and the `rust` switch are passed via `initializationOptions`,
+e.g. `{ "args": ["--workspace"], "rust": false }`. Together with the `binary-cache` feature,
+snippets that did not change are not compiled again on every save.
 
 ### Zed
 
 `zed-extension/` is a [Zed](https://zed.dev) extension that starts `skeptic-lsp`
-for Rust files. Install the binary (`cargo install --path skeptic-lsp`), then in Zed
+for Markdown files. Install the binary (`cargo install --path skeptic-lsp`), then in Zed
 run `zed: install dev extension` and pick the `zed-extension` directory. Pass
-cargo arguments in Zed's `settings.json`:
+options in Zed's `settings.json`:
 
 ```json
 { "lsp": { "skeptic-lsp": { "initialization_options": { "args": ["--workspace"] } } } }

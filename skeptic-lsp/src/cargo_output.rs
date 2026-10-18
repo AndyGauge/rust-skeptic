@@ -655,6 +655,30 @@ Command failed:
     }
 
     #[test]
+    fn should_panic_snippet_that_ran_to_completion_is_reported() {
+        let dir = std::env::temp_dir().join(format!("skeptic-lsp-sp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("sp.md"),
+            "# T\n\n```rust,should_panic\nfn main() {\n    let x = 1;\n}\n```\n",
+        )
+        .unwrap();
+        let out = "\
+---- sp_sect_t_line_3 stdout ----
+thread 'sp_sect_t_line_3' (1) panicked at /x/skeptic/src/rt.rs:410:9:
+the snippet is marked `should_panic` but ran to completion
+";
+        let d = parse(out, &dir);
+        let list = &d[&dir.join("sp.md")];
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert!(list[0].message.contains("should_panic"));
+        // On `fn main`, inside the fenced block.
+        assert_eq!(list[0].range.start.line, 3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn maps_by_content_when_skeptic_adds_blank_lines() {
         let dir = std::env::temp_dir().join(format!("skeptic-lsp-blank-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

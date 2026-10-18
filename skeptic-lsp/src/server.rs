@@ -14,6 +14,10 @@ use crate::runner;
 struct State {
     /// Extra arguments appended to `cargo test` (from `initializationOptions.args`).
     args: Vec<String>,
+    /// Also react to Rust sources and manifests, and report what is found in
+    /// them (`initializationOptions.rust`). Off by default: that is the
+    /// territory of rust-analyzer, and a snippet only needs the markdown.
+    rust: bool,
     /// In-flight run per workspace root; aborted when a newer save arrives.
     running: HashMap<PathBuf, JoinHandle<()>>,
     /// Files we published diagnostics for, per workspace root, so stale ones get cleared.
@@ -47,6 +51,14 @@ impl LanguageServer for Backend {
                 .iter()
                 .filter_map(|a| a.as_str().map(String::from))
                 .collect();
+        }
+        if let Some(rust) = params
+            .initialization_options
+            .as_ref()
+            .and_then(|o| o.get("rust"))
+            .and_then(|r| r.as_bool())
+        {
+            self.state.lock().await.rust = rust;
         }
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -89,10 +101,13 @@ impl LanguageServer for Backend {
         let Ok(file) = params.text_document.uri.to_file_path() else {
             return;
         };
-        // Rust sources, manifests and markdown (skeptic doc tests) can change the outcome.
-        let relevant = file.extension().is_some_and(|e| e == "rs" || e == "md")
+        // Markdown holds skeptic's snippets. Rust sources and manifests can
+        // change their outcome too, but only look at them when asked to.
+        let rust = self.state.lock().await.rust;
+        let markdown = file.extension().is_some_and(|e| e == "md");
+        let rust_file = file.extension().is_some_and(|e| e == "rs")
             || file.file_name().is_some_and(|n| n == "Cargo.toml");
-        if !relevant {
+        if !(markdown || (rust && rust_file)) {
             return;
         }
         let Some(root) = runner::workspace_root(&file).await else {
@@ -100,7 +115,6 @@ impl LanguageServer for Backend {
         };
 
         // A markdown save only needs that file's skeptic snippets, not the whole suite.
-        let markdown = file.extension().is_some_and(|e| e == "md");
         let filter = markdown
             .then(|| {
                 file.file_stem()
@@ -127,7 +141,13 @@ impl LanguageServer for Backend {
                 )
                 .await;
             match runner::check(&task_root, &args, filter.as_deref()).await {
-                Ok(found) => publish(&client, &state, &task_root, found, scope).await,
+                Ok(mut found) => {
+                    if !rust {
+                        // Everything else is rust-analyzer's to report.
+                        found.retain(|path, _| path.extension().is_some_and(|e| e == "md"));
+                    }
+                    publish(&client, &state, &task_root, found, scope).await
+                }
                 Err(e) => {
                     client
                         .show_message(
