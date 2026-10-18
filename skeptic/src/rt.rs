@@ -11,6 +11,8 @@ use std::time::SystemTime;
 
 use cargo_metadata::Edition;
 
+use crate::binary_cache::BinaryCache;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use walkdir::WalkDir;
@@ -166,6 +168,8 @@ struct Prepared {
     /// Directories holding the dependency rlibs (many, in the newer layout).
     search_dirs: Vec<PathBuf>,
     externs: Vec<(String, PathBuf)>,
+    /// Compiled snippets, reused while nothing they were built from changed.
+    binaries: Option<BinaryCache>,
 }
 
 type PreparedKey = (String, String);
@@ -287,12 +291,14 @@ fn prepare(root_dir: &str, target_dir: &str) -> Arc<Prepared> {
         search_dirs.sort();
     }
 
+    let binaries = BinaryCache::open(&target_dir, edition, &externs, &search_dirs);
     let prepared = Arc::new(Prepared {
         edition,
         target_dir,
         deps_dir,
         search_dirs,
         externs,
+        binaries,
     });
     cache.insert(key, Arc::clone(&prepared));
     prepared
@@ -415,7 +421,22 @@ fn execute(
 
     // We use rustc directly, telling it where the rlibs are with -L and
     // their names with --extern (resolved once in `prepare`).
-    let rustc = env::var("RUSTC").unwrap_or_else(|_| String::from("rustc"));
+    let binary_path = out_dir.path().join("out.exe");
+    let cache_key = match (&prepared.binaries, compile_type) {
+        (Some(binaries), CompileType::Full) => {
+            Some((binaries, binaries.key(target_triple, test_text)))
+        }
+        _ => None,
+    };
+    if let Some((binaries, key)) = &cache_key {
+        if let Some(binary) = binaries.restore(key) {
+            return Outcome {
+                steps: vec![run_snippet(&binary, out_dir.path())],
+            };
+        }
+    }
+
+    let rustc = rustc_command();
     let mut cmd = Command::new(rustc);
     cmd.arg(testcase_path)
         .arg("--verbose")
@@ -459,7 +480,6 @@ fn execute(
         }
     }
 
-    let binary_path = out_dir.path().join("out.exe");
     match compile_type {
         CompileType::Full => cmd.arg("-o").arg(&binary_path),
         CompileType::Check => cmd.arg(format!(
@@ -472,13 +492,27 @@ fn execute(
 
     if let CompileType::Full = compile_type {
         if steps[0].failure.is_none() {
-            let mut cmd = Command::new(binary_path);
-            cmd.current_dir(out_dir.path());
-            steps.push(capture(cmd));
+            // Run the cached copy, so that the first time the system looks
+            // a new executable over (macOS takes a while to) is the last.
+            let binary = cache_key
+                .as_ref()
+                .and_then(|(binaries, key)| binaries.store(key, &binary_path))
+                .unwrap_or(binary_path);
+            steps.push(run_snippet(&binary, out_dir.path()));
         }
     }
 
     Outcome { steps }
+}
+
+fn run_snippet(binary_path: &Path, out_dir: &Path) -> Captured {
+    let mut cmd = Command::new(binary_path);
+    cmd.current_dir(out_dir);
+    capture(cmd)
+}
+
+pub(crate) fn rustc_command() -> String {
+    env::var("RUSTC").unwrap_or_else(|_| String::from("rustc"))
 }
 
 fn capture(mut command: Command) -> Captured {
@@ -511,7 +545,32 @@ fn get_rlib_dependencies(
     target_dir: PathBuf,
     metadata: Option<cargo_metadata::Metadata>,
 ) -> Result<Vec<Fingerprint>> {
-    let cache_key_str = format!("{}:{}", root_dir.display(), target_dir.display());
+    let fingerprint_dir =
+        fingerprint_root(&target_dir).unwrap_or_else(|| target_dir.join(".fingerprint"));
+
+    // Collect all fingerprint paths first and sort for deterministic behavior
+    // (`build/<pkg>/<hash>/fingerprint/<file>` is four levels down in the
+    // newer layout; the classic one is two.)
+    let mut fingerprint_paths: Vec<_> = WalkDir::new(fingerprint_dir)
+        .max_depth(4)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path().to_owned())
+        .collect();
+
+    fingerprint_paths.sort();
+
+    // Which builds of the dependencies to link depends on the test binary
+    // that is running, so the cached answer does too.
+    let running_test = running_test_hash().filter(|hash| {
+        fingerprint_paths
+            .iter()
+            .any(|path| is_test_unit(path, hash))
+    });
+    let cache_key_str = match &running_test {
+        Some(hash) => format!("{}:{}#{}", root_dir.display(), target_dir.display(), hash),
+        None => format!("{}:{}", root_dir.display(), target_dir.display()),
+    };
     let cache_key_hash = PersistentCache::generate_cache_key_hash(&root_dir, &target_dir);
 
     let mut persistent_cache = PersistentCache::load_from_file(&target_dir)?;
@@ -536,37 +595,26 @@ fn get_rlib_dependencies(
     let direct_deps = lock.get_direct_dependencies().clone();
     let locked_deps: HashMap<String, String> = lock.collect();
 
-    // Check if cached dependencies are still valid: every locked dependency
-    // must be represented (this detects dependencies added to Cargo.lock) and
-    // every cached rlib must still exist (a rebuild replaces them).
+    // Check if cached dependencies are still valid: every cached rlib must
+    // still exist (a rebuild replaces them), and, unless they were chosen by
+    // a finished test binary (whose dependencies are all built), every locked
+    // dependency must be represented, which detects dependencies that were
+    // not yet built when the cache was filled. Not every locked dependency
+    // ever is: those for other platforms are never built.
     if let Some(cached_deps) = persistent_cache.get(&cache_key_str, cache_key_hash) {
         let cached_dep_names: HashSet<String> =
             cached_deps.iter().map(|d| d.name().to_string()).collect();
 
-        let all_present = locked_deps
-            .keys()
-            .all(|dep_name| cached_dep_names.contains(dep_name));
+        let all_present = running_test.is_some()
+            || locked_deps
+                .keys()
+                .all(|dep_name| cached_dep_names.contains(dep_name));
         let all_exist = cached_deps.iter().all(|d| d.rlib.exists());
 
         if all_present && all_exist {
             return Ok(cached_deps.clone());
         }
     }
-
-    let fingerprint_dir =
-        fingerprint_root(&target_dir).unwrap_or_else(|| target_dir.join(".fingerprint"));
-
-    // Collect all fingerprint paths first and sort for deterministic behavior
-    // (`build/<pkg>/<hash>/fingerprint/<file>` is four levels down in the
-    // newer layout; the classic one is two.)
-    let mut fingerprint_paths: Vec<_> = WalkDir::new(fingerprint_dir)
-        .max_depth(4)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path().to_owned())
-        .collect();
-
-    fingerprint_paths.sort();
 
     // A crate can have several builds of the very same version (different
     // features, or built for build scripts), and rustc only accepts the one
@@ -600,18 +648,7 @@ fn get_rlib_dependencies(
         candidates.push(Candidate { finger, own_hash });
     }
 
-    // Count the builds that depend on each one, over every unit (including
-    // the root package's own test targets, which are the ground truth for
-    // what a snippet is compiled alongside).
-    let mut referrers: HashMap<String, usize> = HashMap::new();
-    for path in fingerprint_paths
-        .iter()
-        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
-    {
-        for hash in unit_hashes(path).1 {
-            *referrers.entry(hash).or_default() += 1;
-        }
-    }
+    let referrers = dependents(&fingerprint_paths, running_test.as_deref());
 
     // Prefer versioned, then most depended-upon, then freshest; on a tie the
     // later path wins, which keeps the choice deterministic.
@@ -668,6 +705,83 @@ fn get_rlib_dependencies(
     let _ = persistent_cache.save_to_file(&target_dir);
 
     Ok(result)
+}
+
+/// The unit hash of the test executable that is running, which cargo puts at
+/// the end of its file name (`target/debug/deps/<name>-<hash>`).
+fn running_test_hash() -> Option<String> {
+    let exe = env::current_exe().ok()?;
+    let (_, hash) = exe.file_stem()?.to_str()?.rsplit_once('-')?;
+    (hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit())).then(|| hash.to_owned())
+}
+
+/// The hash of the unit a fingerprint file belongs to, in either layout.
+fn unit_dir_hash(json_path: &Path) -> Option<&str> {
+    let unit_dir = json_path.parent()?;
+    let name = unit_dir.file_name()?.to_str()?;
+    if name == "fingerprint" {
+        return unit_dir.parent()?.file_name()?.to_str();
+    }
+    name.rsplit_once('-').map(|(_, hash)| hash)
+}
+
+/// Whether a fingerprint file is that of the test target with this unit hash.
+/// Its name is `test-<kind>-<name>.json`; a build script has dependencies of
+/// its own, which are not what snippets are compiled against.
+fn is_test_unit(json_path: &Path, hash: &str) -> bool {
+    json_path.extension().is_some_and(|ext| ext == "json")
+        && json_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("test-"))
+        && unit_dir_hash(json_path) == Some(hash)
+}
+
+/// How much each build is depended upon, keyed by fingerprint hash.
+///
+/// A target directory keeps every build ever made in it: the same crate with
+/// other features, or built for build scripts. With the test executable that
+/// is running at hand, its fingerprint says which builds it was linked with,
+/// and so does the fingerprint of each of those, all the way down; those are
+/// the only builds a snippet can be compiled alongside. Without it (or without
+/// finding it), every unit counts, and the most widely used build wins.
+fn dependents(fingerprint_paths: &[PathBuf], running_test: Option<&str>) -> HashMap<String, usize> {
+    let units: Vec<(&PathBuf, Option<String>, HashSet<String>)> = fingerprint_paths
+        .iter()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .map(|path| {
+            let (own, deps) = unit_hashes(path);
+            (path, own, deps)
+        })
+        .collect();
+
+    let mut referrers: HashMap<String, usize> = HashMap::new();
+
+    let mut pending: Vec<&String> = units
+        .iter()
+        .filter(|(path, ..)| running_test.is_some_and(|hash| is_test_unit(path, hash)))
+        .flat_map(|(_, _, deps)| deps)
+        .collect();
+
+    if !pending.is_empty() {
+        let by_hash: HashMap<&String, &HashSet<String>> = units
+            .iter()
+            .filter_map(|(_, own, deps)| Some((own.as_ref()?, deps)))
+            .collect();
+        while let Some(hash) = pending.pop() {
+            if referrers.insert(hash.clone(), 1).is_none() {
+                pending.extend(by_hash.get(hash).into_iter().flat_map(|deps| deps.iter()));
+            }
+        }
+        return referrers;
+    }
+
+    for (_, _, deps) in &units {
+        for hash in deps {
+            *referrers.entry(hash.clone()).or_default() += 1;
+        }
+    }
+    referrers
 }
 
 /// The fingerprint hash of a unit and of the dependency builds it was
@@ -1151,5 +1265,133 @@ mod cache_write_tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, [".skeptic-cache"]);
+    }
+}
+
+#[cfg(test)]
+mod dependents_tests {
+    use super::*;
+
+    /// A fingerprint as cargo writes it: `<dir>/<file>` holds the unit's own
+    /// hash and `<dir>/<file>.json` the hashes of its dependencies. Hashes are
+    /// given in the form `unit_hashes` reports them.
+    fn unit(dir: &Path, unit_dir: &str, file: &str, own: &str, deps: &[&str]) -> PathBuf {
+        let unit_dir = dir.join(unit_dir);
+        fs::create_dir_all(&unit_dir).unwrap();
+        fs::write(unit_dir.join(file), own).unwrap();
+        let deps: Vec<String> = deps
+            .iter()
+            .map(|hash| {
+                let value = u64::from_str_radix(hash, 16).unwrap().swap_bytes();
+                format!("[0,\"dep\",false,{value}]")
+            })
+            .collect();
+        let json = unit_dir.join(format!("{file}.json"));
+        fs::write(&json, format!("{{\"deps\":[{}]}}", deps.join(","))).unwrap();
+        json
+    }
+
+    // serde_json built twice (`on` has an extra dependency), each used by its
+    // own test binary, and once more for the build script.
+    fn target() -> (tempfile::TempDir, Vec<PathBuf>) {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let paths = vec![
+            unit(
+                d,
+                "app-aaaaaaaaaaaaaaaa",
+                "test-integration-test-t",
+                "00000000000000a1",
+                &["00000000000000c1"],
+            ),
+            unit(
+                d,
+                "app-bbbbbbbbbbbbbbbb",
+                "test-integration-test-t",
+                "00000000000000b1",
+                &["00000000000000c2"],
+            ),
+            unit(
+                d,
+                "app-cccccccccccccccc",
+                "build-script-build-script-build",
+                "00000000000000d1",
+                &["00000000000000c3"],
+            ),
+            unit(
+                d,
+                "serde_json-1111111111111111",
+                "lib-serde_json",
+                "00000000000000c1",
+                &["00000000000000e1"],
+            ),
+            unit(
+                d,
+                "serde_json-2222222222222222",
+                "lib-serde_json",
+                "00000000000000c2",
+                &[],
+            ),
+            unit(
+                d,
+                "serde_json-3333333333333333",
+                "lib-serde_json",
+                "00000000000000c3",
+                &[],
+            ),
+            unit(
+                d,
+                "indexmap-4444444444444444",
+                "lib-indexmap",
+                "00000000000000e1",
+                &[],
+            ),
+        ];
+        (dir, paths)
+    }
+
+    #[test]
+    fn running_test_selects_only_its_own_builds() {
+        let (_dir, paths) = target();
+        let referrers = dependents(&paths, Some("aaaaaaaaaaaaaaaa"));
+        let mut hashes: Vec<_> = referrers.keys().map(String::as_str).collect();
+        hashes.sort();
+        // Its direct dependency, and what that was built against; not the
+        // other test's build, nor the build script's.
+        assert_eq!(hashes, ["00000000000000c1", "00000000000000e1"]);
+
+        let referrers = dependents(&paths, Some("bbbbbbbbbbbbbbbb"));
+        assert_eq!(referrers.keys().collect::<Vec<_>>(), ["00000000000000c2"]);
+    }
+
+    #[test]
+    fn without_a_running_test_every_unit_counts() {
+        let (_dir, paths) = target();
+        for running in [None, Some("ffffffffffffffff")] {
+            let referrers = dependents(&paths, running);
+            assert_eq!(referrers.len(), 4);
+            assert!(referrers.values().all(|&n| n == 1));
+        }
+    }
+
+    #[test]
+    fn a_build_script_is_not_a_test() {
+        let (_dir, paths) = target();
+        // Running as the build script must not narrow anything down.
+        assert_eq!(dependents(&paths, Some("cccccccccccccccc")).len(), 4);
+    }
+
+    #[test]
+    fn new_layout_units_are_found_by_their_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = unit(
+            dir.path(),
+            "build/app/aaaaaaaaaaaaaaaa/fingerprint",
+            "test-integration-test-t",
+            "00000000000000a1",
+            &["00000000000000c1"],
+        );
+        assert_eq!(unit_dir_hash(&json), Some("aaaaaaaaaaaaaaaa"));
+        assert_eq!(dependents(&[json], Some("aaaaaaaaaaaaaaaa")).len(), 1);
     }
 }

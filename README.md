@@ -252,6 +252,20 @@ custom support in the markdown renderer.
 
 If you don't need advanced features but just to test markdown content, the [doc-comment](https://crates.io/crates/doc-comment) crate might better match your needs. It also prevents recompilations and can be used as a `dev-dependency`.
 
+## Reusing compiled snippets
+
+Every test run compiles every snippet again. The `binary-cache` feature keeps the compiled executables in `target/<profile>/.skeptic-bin/` and reuses them while the snippet, the compiler and the libraries it links are unchanged. Only the executable is reused; the snippet still runs every time. It is off by default because the executables can add up to hundreds of megabytes in a large project (the least recently used are removed above 1024 MB, or `SKEPTIC_BINARY_CACHE_MB`).
+
+```toml
+[build-dependencies]
+skeptic = { version = "0.14", features = ["binary-cache"] }
+
+[dev-dependencies]
+skeptic = { version = "0.14", features = ["binary-cache"] }
+```
+
+Set `SKEPTIC_NO_BINARY_CACHE` to skip it for a single run.
+
 ## License
 
 Licensed under either of
