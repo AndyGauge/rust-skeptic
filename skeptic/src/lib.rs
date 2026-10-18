@@ -473,7 +473,12 @@ fn create_test_runner(
     if test.ignore {
         writeln!(s, "#[ignore]")?;
     }
-    if test.should_panic {
+    // A snippet that is run and should panic is checked by the runtime, which
+    // tells a panic of the snippet from a failure to compile it (both would
+    // satisfy `#[should_panic]`). Without running it, a failure to compile is
+    // the panic that is expected.
+    let panics_when_run = test.should_panic && !test.no_run;
+    if test.should_panic && !panics_when_run {
         writeln!(s, "#[should_panic]")?;
     }
 
@@ -496,7 +501,12 @@ fn create_test_runner(
     } else {
         writeln!(
             s,
-            "    skeptic::rt::run_test(r#\"{}\"#, r#\"{}\"#, r#\"{}\"#, s);",
+            "    skeptic::rt::{}(r#\"{}\"#, r#\"{}\"#, r#\"{}\"#, s);",
+            if panics_when_run {
+                "run_test_should_panic"
+            } else {
+                "run_test"
+            },
             config.root_dir.to_str().unwrap(),
             config.out_dir.to_str().unwrap(),
             config.target_triple
