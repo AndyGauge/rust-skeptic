@@ -9,6 +9,7 @@ use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Parser, Tag};
 
 use crate::rt::SkepticError;
 
+mod binary_cache;
 pub mod rt;
 #[cfg(test)]
 mod tests;

@@ -12,6 +12,12 @@ categories = ["development-tools", "development-tools::testing"]
 edition = "2021"
 rust-version = "1.85"
 
+[features]
+# Keep compiled snippets in `target/<profile>/.skeptic-bin/` and reuse them
+# while nothing they were built from changed. Off by default: the executables
+# can add up to hundreds of megabytes.
+binary-cache = []
+
 [dependencies]
 bytecount = "0.6"
 cargo_metadata = "0.15"

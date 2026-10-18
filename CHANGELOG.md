@@ -1,3 +1,9 @@
+# 0.14.2 (unreleased)
+
+* Fix snippets linking the wrong build of a dependency when `target/` holds several (the same crate built with other features): the dependencies are now those the running test binary was linked with, read from its fingerprint and followed transitively. Which build of a dependency is chosen no longer varies from run to run
+* The dependency cache is now reused for projects whose `Cargo.lock` lists crates that are never built on this platform (it never was, so every run walked the fingerprints again)
+* New `binary-cache` feature (off by default; it can take hundreds of megabytes): compiled snippets are kept in `target/<profile>/.skeptic-bin/` and reused while the snippet, rustc, edition, target and the libraries it links are unchanged; only the executable is cached, the snippet still runs every time. On macOS this also avoids the system vetting each fresh executable again (the rust-cookbook suite goes from ~77s to ~5s when nothing changed). `SKEPTIC_NO_BINARY_CACHE` turns it off for a run and `SKEPTIC_BINARY_CACHE_MB` (default 1024) bounds its size
+
 # 0.14.1
 
 * The `.skeptic-cache` file now lives in the target directory (`target/<profile>/`) instead of the project root, so `cargo clean` removes it and it needs no `.gitignore` entry
