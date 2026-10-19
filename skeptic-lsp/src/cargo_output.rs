@@ -265,8 +265,8 @@ fn split_sections<'a>(lines: &[&'a str]) -> Vec<Section<'a>> {
                 name: None,
                 lines: Vec::new(),
             });
-        } else {
-            sections.last_mut().unwrap().lines.push(line);
+        } else if let Some(current) = sections.last_mut() {
+            current.lines.push(line);
         }
     }
     sections
@@ -702,7 +702,8 @@ warning: unused variable: `x`
 5 |     let x = 1;
   |         ^ help: prefix it
 ",
-            dir.display()
+            // JSON-escaped: a Windows path has backslashes.
+            serde_json::to_string(&dir.display().to_string()).unwrap().trim_matches('"')
         );
         let d = parse(&out, &dir);
         let list = &d[&dir.join("main.md")];
