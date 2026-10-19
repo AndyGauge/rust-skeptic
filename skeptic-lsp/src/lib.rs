@@ -2,7 +2,10 @@
 //! and test panics (`panic!`, `assert!`, ...) as editor diagnostics.
 
 // A language server must not take the editor's session down: no panicking shortcuts.
-#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
 
 use tower_lsp::{LspService, Server};
 
