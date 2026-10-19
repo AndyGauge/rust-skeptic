@@ -1,3 +1,15 @@
+# 0.15.0 (unreleased)
+
+* Fix: a snippet marked `should_panic` that does not compile no longer passes. A failure to compile used to be indistinguishable from the panic that was asked for. Now it fails the test, as does a snippet that runs to completion (with the message ``the snippet is marked `should_panic` but ran to completion``). `no_run,should_panic` still expects the compile to fail. Projects with such a snippet will see it fail, and should fix it
+* New `skeptic-lsp` crate: a [tower-lsp](https://crates.io/crates/tower-lsp) language server for the code blocks in your markdown. Saving a markdown file that skeptic tests runs only that file's snippets (`cargo test --no-fail-fast --message-format=json`) and reports, on the matching markdown lines,
+  * snippets that do not compile, with rustc's errors and warnings read from cargo's JSON messages, and
+  * snippets that panic when run, on the panic location
+* The code block header is respected: `ignore` is not reported, `no_run` is only compiled, a `should_panic` block is reported when it does not compile or runs to completion, and `no_run,should_panic` expects the compile to fail
+* Rust sources and `Cargo.toml` are rust-analyzer's: saving them does nothing and nothing found in them is reported, unless `"rust": true` is passed in `initializationOptions`. A newer save cancels the run in progress, and extra `cargo test` arguments (such as `--workspace`) come from `{ "args": [...] }`
+* Run it as the `skeptic-lsp` binary, or enable the new `lsp` feature of `skeptic` (off by default) to start it with `skeptic::lsp::run_stdio()`. With the `binary-cache` feature, snippets that did not change are not compiled again on every save
+* New `zed-extension/`: a [Zed](https://zed.dev) extension that starts `skeptic-lsp` for Markdown files
+* Panic locations are read from libtest's plain failure report, since libtest's own JSON output is still unstable (see the [libtest JSON goal](https://goals.rust-lang.org/2026/libtest-json.html)); only cargo's messages are parsed as JSON
+
 # 0.14.2
 
 * Fix snippets linking the wrong build of a dependency when `target/` holds several (the same crate built with other features): the dependencies are now those the running test binary was linked with, read from its fingerprint and followed transitively. Which build of a dependency is chosen no longer varies from run to run

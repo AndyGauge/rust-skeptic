@@ -145,6 +145,7 @@ pub fn compile_test(root_dir: &str, out_dir: &str, target_triple: &str, test_tex
         target_triple,
         test_text,
         CompileType::Check,
+        Expect::Success,
     );
 }
 
@@ -155,6 +156,21 @@ pub fn run_test(root_dir: &str, out_dir: &str, target_triple: &str, test_text: &
         target_triple,
         test_text,
         CompileType::Full,
+        Expect::Success,
+    );
+}
+
+/// Like [`run_test`] for a snippet marked `should_panic`: the test passes when
+/// the snippet fails when run, and fails if it does not compile or runs to
+/// completion.
+pub fn run_test_should_panic(root_dir: &str, out_dir: &str, target_triple: &str, test_text: &str) {
+    handle_test(
+        root_dir,
+        out_dir,
+        target_triple,
+        test_text,
+        CompileType::Full,
+        Expect::RunFailure,
     );
 }
 
@@ -372,6 +388,7 @@ fn handle_test(
     target_triple: &str,
     test_text: &str,
     compile_type: CompileType,
+    expect: Expect,
 ) {
     let prepared = prepare(root_dir, target_dir);
     let target_triple = target_triple.to_owned();
@@ -391,12 +408,19 @@ fn handle_test(
 
     // Report from the test's own thread so libtest attributes output and
     // panics (including `should_panic`) to the right test.
-    for step in outcome.steps {
+    let mut ran_to_completion = false;
+    for (i, step) in outcome.steps.into_iter().enumerate() {
         print!("{}", String::from_utf8_lossy(&step.stdout));
         eprint!("{}", String::from_utf8_lossy(&step.stderr));
-        if let Some(failure) = step.failure {
-            panic!("{}", failure);
+        match step.failure {
+            // The second step runs the snippet; the first compiles it.
+            Some(_) if expect == Expect::RunFailure && i > 0 => return,
+            Some(failure) => panic!("{}", failure),
+            None => ran_to_completion = i > 0,
         }
+    }
+    if expect == Expect::RunFailure && ran_to_completion {
+        panic!("the snippet is marked `should_panic` but ran to completion");
     }
 }
 
@@ -1137,6 +1161,15 @@ pub enum SkepticError {
 }
 
 type Result<T> = std::result::Result<T, SkepticError>;
+
+/// What a test expects of its snippet.
+#[derive(Clone, Copy, PartialEq)]
+enum Expect {
+    /// Every step succeeds.
+    Success,
+    /// It compiles, and failing (panicking) when run is the point.
+    RunFailure,
+}
 
 #[derive(Clone, Copy)]
 enum CompileType {
